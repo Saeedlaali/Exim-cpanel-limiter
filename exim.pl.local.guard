@@ -1,0 +1,3227 @@
+use Email::MIME;
+my $VALIASES_DIR       = '/etc/valiases';
+my $VDOMAINALIASES_DIR = '/etc/vdomainaliases';
+
+my $outgoing_sender;
+my $outgoing_sender_domain;
+my $outgoing_sender_counted_domain;
+my $outgoing_sender_sysuser;
+my $outgoing_sender_is_mailman;
+my $outgoing_sender_archive_directory = 'outgoing';
+my $mail_gid;
+my $nobody_uid;
+my $nobody_gid;
+my $mailtrap_gid;
+my $check_mail_permissions_domain     = '';
+my $check_mail_permissions_sender     = '';
+my $check_mail_permissions_msgid      = '';
+my $check_mail_permissions_data       = '';
+my $check_mail_permissions_is_mailman = 0;
+my $enforce_mail_permissions_data     = '';
+my $primary_hostname;
+my %uid_cache  = ( 0      => 'root', 47         => 'mailnull', 99       => 'nobody' );
+my %user_cache = ( 'root' => 0,      'mailnull' => 47,         'nobody' => 99 );
+my $reattempt_message = 'Message will be reattempted later';
+my $sender_lookup;
+my $sender_lookup_method;
+
+# TEST VARIABLES
+my $check_mail_permissions_result;
+
+my %file_exists_cache;
+
+sub file_exists {
+    return $file_exists_cache{ $_[0] } if exists $file_exists_cache{ $_[0] };
+    $file_exists_cache{ $_[0] } = -e $_[0] ? 1 : 0;
+    return $file_exists_cache{ $_[0] };
+}
+
+sub checkbx_autowhitelist {
+    my $address = shift;
+    my $phost   = Exim::expand_string('$primary_hostname');
+    my $rp      = Exim::expand_string('$received_protocol');
+    if ( $rp eq 'local' || $rp !~ /^e?smtps?a$/i || !$address || $address eq '' ) { return 'no'; }
+    my ( $localpart, $domain ) = split( /\@/, $address );
+
+    if ( ( !$domain || $domain eq '' || $domain eq $phost ) ) {
+        my $homedir = gethomedir($localpart);
+        unless ( $homedir ne '' ) {
+            return 'no';
+        }
+
+        if ( -e $homedir . '/etc/.boxtrapperenable' && !-e $homedir . '/etc/.boxtrapperautowhitelistdisable' ) {
+            return 'yes';
+        }
+        else {
+            return 'no';
+        }
+    }
+    else {
+        my $owner   = getdomainowner($domain);
+        my $homedir = gethomedir($owner);
+        unless ( $homedir ne '' ) {
+            return 'no';
+        }
+        my $passwd = "${homedir}/etc/${domain}/passwd";
+        my $addressexists = user_exists_in_db( $localpart, $passwd );
+        if ( $addressexists && ( -e $homedir . "/etc/${domain}/${localpart}/.boxtrapperenable" && !-e $homedir . "/etc/${domain}/${localpart}/.boxtrapperautowhitelistdisable" ) ) {
+            return 'yes';
+        }
+        else {
+            return 'no';
+        }
+    }
+}
+
+sub getemailuser {
+    my ( $address, $received_protocol, $sender_ident ) = @_;
+
+    my $primary_hostname = Exim::expand_string('$primary_hostname');
+    my ( $local_part, $domain ) = split( m/[\@\+\%\:]/, ( $address || ( $received_protocol && $received_protocol eq 'local' ? $sender_ident : '' ) ) );
+
+    if ( !$domain || $domain eq '' || $domain eq $primary_hostname ) {
+        return $local_part;
+    }
+    else {
+        my $user = getdomainowner($domain);
+        if ($user) { return $user; }
+    }
+
+    return 'nobody';
+}
+#DO NOT REMOVE THIS COMMENT AS IT TELLS CPANEL TO ENABLE SERVICE AUTH CHECKING
+#exim:serviceauth=1
+#
+# Checkpass not used since auth is passed to dovecot SASL
+
+{
+    no warnings 'redefine';
+    sub checkuserpass { 0; }
+
+    sub checkpass { 0; }
+}
+sub checkspam {
+
+    # This is an old code block that should never be reached unless there is a serious
+    # problem installing their exim configuration
+    Exim::log_write("Something went very wrong during the exim configuration update.  Please try reinstalling your exim configuration.");
+    1;
+}
+
+sub convert_address_directory_to_dovecot_lda_destination_username {
+    my $local_part = Exim::expand_string('$local_part');
+    my $domain     = Exim::expand_string('$domain');
+    $primary_hostname ||= Exim::expand_string('$primary_hostname');
+    my $address_file = Exim::expand_string('$address_file');
+
+    if ( $address_file !~ m{mail/\Q$domain\E} ) {
+        return ( getpwuid($>) )[0];
+    }
+    else {
+        return $local_part . '@' . $domain;
+    }
+
+}
+
+sub convert_address_directory_to_dovecot_lda_mailbox {
+    my $address_file = Exim::expand_string('$address_file');
+
+    my ($mailbox) = $address_file =~ m{/\.([^\/]+)};
+    if ($mailbox) {
+        return "INBOX.$mailbox";
+    }
+
+    return 'INBOX';
+
+}
+
+sub call_cpwrap {
+    my ( $function, @ARGS ) = @_;
+
+    my @JSON_ENCODED_ARGS = map { aggressive_json_safe_encode($_) } @ARGS;
+    my $data = join( ' ', @JSON_ENCODED_ARGS );
+    my $json_template = qq[{"function":"$function","namespace":"Cpanel","version":2,"action":"run","data":"$data","send_data_only":1,"module":"exim"}\r\n\r\n];
+    require Cpanel::Encoder::Exim;
+    return eval { Exim::expand_string( '${readsocket{/usr/local/cpanel/var/cpwrapd.sock}{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($json_template) . '}{10s}}' ); };
+}
+
+sub aggressive_json_safe_encode {
+    my ($arg) = @_;
+    $arg =~ tr/^a-zA-Z0-9!#\$\-=?^_{}~:.//cd;
+    return $arg;
+}
+
+my $archived_at_domain_level = 0;
+my $archived_outgoing        = 0;
+my $archived_mailman         = 0;
+
+sub should_archive_incoming_domain_message {
+    return ( $archived_at_domain_level = !_message_has_been_seen() );
+}
+
+sub _message_has_been_seen {
+
+    #ARCHIVE ONLY IF
+    #
+    #$parent_domain = ""
+    #
+    #OR
+    #
+    #$parent_domain != $domain
+
+    # Delivery was not a result of an expansion
+    my $parent_domain = Exim::expand_string('$parent_domain');
+    if ( !length $parent_domain ) {
+        return 0;
+    }
+
+    # Delivery was the result of an expansion / alias.  Since its a diffrent domain we don't
+    # know if it was archived so we need to archive if enabled
+    my $domain = Exim::expand_string('$domain');
+    if ( $domain ne $parent_domain ) {
+        return 0;
+    }
+
+    my $parent_local_part = Exim::expand_string('$parent_local_part');
+    my $local_part        = Exim::expand_string('$local_part');
+
+    # case 60975: If any deliveries happened, parent_domain and parent_local_part
+    # will get set to match domain and local_part. Since we need to
+    # still archive outgoing if it to our same domain or a local
+    # user we need to accept when they all match
+    if ( $parent_domain eq $domain && $local_part && $parent_local_part ) {
+        return 0;
+    }
+
+    # parent_local_part ne local_part and
+    # parent_domain == domain so it already got archived if we have it on
+
+    return 1;
+}
+
+sub archive_headers {
+    my ($archive_router) = @_;
+
+    if ( $archive_router eq 'incoming_domain' ) {
+        return "X-Archive-Type: incoming\nX-Archive-Recipient: " . Exim::expand_string('$local_part') . '@' . Exim::expand_string('$domain');
+    }
+    elsif ( $archive_router eq 'incoming_localuser' ) {
+        return "X-Archive-Type: incoming\nX-Archive-Recipient: " . Exim::expand_string('$local_part');
+    }
+    elsif ( $archive_router eq 'outgoing' ) {
+        return "X-Archive-Type: " . $outgoing_sender_archive_directory . "\nX-Archive-Sender: $outgoing_sender";
+    }
+
+}
+
+sub should_archive_incoming_localuser_message {
+
+    # case 60999: Do not archive a message at the localuser level
+    # if we have already archived it at the domain level (avoid two copies)
+    return 0 if $archived_at_domain_level;
+
+    my $local_part      = Exim::expand_string('$local_part');
+    my $incoming_domain = getusersdomain($local_part);
+    if ($incoming_domain) {
+        my $home = gethomedir($local_part);
+        if ( file_exists("$home/etc/$incoming_domain/archive/incoming") ) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+sub get_incoming_domain {
+    return getusersdomain( Exim::expand_string('$local_part') );
+}
+
+sub should_archive_outgoing_message {
+    return 0 if _message_has_been_seen();
+
+    return determine_sender_and_check_if_archive_needed();
+}
+
+sub determine_sender_and_check_if_archive_needed {
+    my $uid = int( Exim::expand_string('$originator_uid') );
+    my $gid = int( Exim::expand_string('$originator_gid') );
+
+    # outgoing_sender_domain is the domain of the actual sender
+    # outgoing_sender_counted_domain is the domain we actually count the message against
+
+    # Currently these are always the same except domain may be
+    # rewritten if we are coming from a mailman list in order
+    # to count against the owner of the list instead of the mailman
+    # user assuming /var/cpanel/email_send_limits/count_mailman exists
+    ( $outgoing_sender, $outgoing_sender_domain, $outgoing_sender_counted_domain, $outgoing_sender_is_mailman ) = get_message_sender( $uid, $gid );
+
+    if ( $outgoing_sender_domain && $outgoing_sender_domain ne '-system-' ) {
+        $outgoing_sender_sysuser = getdomainowner($outgoing_sender_domain);
+
+        my $home = gethomedir($outgoing_sender_sysuser);
+
+        if ( $outgoing_sender_is_mailman && file_exists("$home/etc/$outgoing_sender_domain/archive/mailman") ) {
+            $outgoing_sender_archive_directory = 'mailman';
+            return 0 if $archived_mailman;    # already archived
+            return ( $archived_mailman = 1 );
+        }
+        elsif ( file_exists("$home/etc/$outgoing_sender_domain/archive/outgoing") ) {
+            $outgoing_sender_archive_directory = 'outgoing';
+            return 0 if $archived_outgoing;    # already archived
+            return ( $archived_outgoing = 1 );
+        }
+    }
+    return 0;
+
+}
+
+# The pack and unpack functions save and restore the state of the
+# sender globals so that when the delivery happens in a separate
+# process then the reception of the message the state is restored
+# and the correct domain/sender is assigned/archived.
+
+my $SOH_BYTE = chr(1);
+my $PACK_KEY = 'packed_archive_address_data';
+
+sub pack_archive_address_data {
+    return join( $SOH_BYTE, map { s/$SOH_BYTE//g; $_; } ( $PACK_KEY, $outgoing_sender, $outgoing_sender_domain, $outgoing_sender_sysuser, $outgoing_sender_archive_directory ) );
+}
+
+#
+# Sometimes the transport happens in a different process than the router
+# so we need to extract the data that was saved in exim's $address_data which
+# was preserved between the router and transport so we can restore the variables
+# we use to determine how to archive the message.
+#
+sub unpack_archive_address_data {
+    my ($packed_address_data) = @_;
+
+    my @unpacked = split( m{$SOH_BYTE}, $packed_address_data );
+    if ( shift @unpacked eq $PACK_KEY ) {
+        ( $outgoing_sender, $outgoing_sender_domain, $outgoing_sender_sysuser, $outgoing_sender_archive_directory ) = @unpacked;
+        return 1;
+    }
+
+    return 0;
+}
+
+sub get_outgoing_sender {
+    unpack_archive_address_data( Exim::expand_string('$address_data') ) if !defined $outgoing_sender_domain;
+    return $outgoing_sender;
+}
+
+sub get_outgoing_sender_domain {
+    unpack_archive_address_data( Exim::expand_string('$address_data') ) if !defined $outgoing_sender_domain;
+    return $outgoing_sender_domain;
+}
+
+sub get_outgoing_sender_sysuser {
+    unpack_archive_address_data( Exim::expand_string('$address_data') ) if !defined $outgoing_sender_domain;
+    return $outgoing_sender_sysuser;
+}
+
+sub get_outgoing_archive_directory {
+    unpack_archive_address_data( Exim::expand_string('$address_data') ) if !defined $outgoing_sender_domain;
+    return $outgoing_sender_archive_directory;
+}
+
+sub YYYYMMDDGMT {
+    my ( $sec, $min, $hour, $mday, $mon, $year ) = gmtime( $_[0] || time() );
+    return sprintf( '%04d-%02d-%02d', $year + 1900, $mon + 1, $mday );
+}
+our $DEFAULT_EMAIL_SEND_LIMITS_DEFER_CUTOFF_PERCENTAGE = 125;
+
+sub getmaxemailsperhour {
+    my $domain = shift;
+
+    return 0 if $domain eq '-system-';
+
+    $domain =~ s/\///g;    #jic
+
+    my $maxemails = 0;     # Defaults to "unlimited"
+
+    my $master_email_send_limits_mtime = ( stat('/etc/email_send_limits') )[9];
+    my $max_fh;
+
+    if ( open( $max_fh, '<', '/var/cpanel/email_send_limits/cache/' . $domain ) && ( stat($max_fh) )[9] > $master_email_send_limits_mtime ) {    # This is the user's main domain. All user's domains are aggregated here
+        $maxemails = readline $max_fh;
+        close $max_fh;
+        return ( $maxemails ? int($maxemails) : 0 );
+    }
+
+    my $search_regex          = qr/^\Q$domain\E:/;
+    my $search_wildcard_regex = qr/^\Q*\E:/;
+
+    _check_cache_dir();
+
+    my $old_umask = umask();
+    umask(0027);
+
+    #format DOMAIN: MAX_EMAIL_PER_HOUR,MAX_DEFER_FAIL_PERCENTAGE,MIN_DEFER_FAIL_TO_TRIGGER_PROTECTION
+    if ( open( my $max_fh, '>', '/var/cpanel/email_send_limits/cache/.' . $domain ) ) {
+        umask($old_umask);
+        if ( open( my $email_limits_fh, '<', '/etc/email_send_limits' ) ) {
+            while ( readline($email_limits_fh) ) {
+                if ( $_ =~ $search_regex ) {
+                    $maxemails = ( split( /\,/, ( split( /:\s+/, $_ ) )[1] ) )[0];
+                    last if $maxemails || $maxemails eq '0';    # case 51568: if there is no value we use the wildcard
+                }
+                elsif ( $_ =~ $search_wildcard_regex ) {
+                    $maxemails = ( split( /\,/, ( split( /:\s+/, $_ ) )[1] ) )[0];
+                    last;
+                }
+            }
+        }
+        chomp $maxemails;
+        print {$max_fh} $maxemails;
+        close($max_fh);
+        rename( '/var/cpanel/email_send_limits/cache/.' . $domain, '/var/cpanel/email_send_limits/cache/' . $domain );    #rename is atomic and will overwrite the file
+        return int $maxemails;                                                                                            # case 51568: must transform 'unlimited' to 0
+    }
+    else {
+        umask($old_umask);
+    }
+    return 0;
+}
+
+sub increment_max_emails_per_hour {
+    my ( $domain, $time, $msgid ) = @_;
+    $domain =~ s/\///g;                                                                                                   #jic
+
+    _check_tracker_dir($domain);
+
+    $time ||= time();
+
+    Exim::log_write( "SMTP connection outbound $time $msgid $domain " . Exim::expand_string('$local_part') . '@' . Exim::expand_string('$domain') );
+
+    if ( open( my $emailt_fh, '>>', "/var/cpanel/email_send_limits/track/$domain/" . join( '.', ( gmtime($time) )[ 2, 3, 4, 5 ] ) ) ) {
+
+        print {$emailt_fh} '1';
+        close($emailt_fh);
+    }
+
+    # !DEBUG!
+    #   if ( open( my $emailt_fh, '>>', "/var/cpanel/email_send_limits/track/$domain/msgids_" . join( '.', ( gmtime( $time ) )[ 2, 3, 4, 5 ] ) ) ) {
+    #
+    #       print {$emailt_fh} $msgid . "\n";
+    #       close($emailt_fh);
+    #  }
+
+}
+
+sub _check_cache_dir {
+    mkdir( '/var/cpanel/email_send_limits/cache', 0750 ) if !-e '/var/cpanel/email_send_limits/cache';
+}
+
+sub _check_tracker_dir {
+    my $domain = shift;
+    $domain =~ s/\///g;    #jic
+
+    if ( !-e '/var/cpanel/email_send_limits/track/' . $domain ) {
+        mkdir( '/var/cpanel/email_send_limits',                  0750 );
+        mkdir( '/var/cpanel/email_send_limits/track',            0750 );
+        mkdir( '/var/cpanel/email_send_limits/track/' . $domain, 0750 );
+    }
+}
+
+sub get_current_emails_per_hour {
+    ( ( stat( "/var/cpanel/email_send_limits/track/$_[0]/" . join( '.', ( gmtime( $_[1] || time() ) )[ 2, 3, 4, 5 ] ) ) )[7] || 0 );
+}
+
+sub reached_max_emails_per_hour {
+    my $domain = shift;
+    $domain =~ s/\///g;    #jic
+    my $max_allowed = int( shift || 0 );
+    my $time = shift || time();
+
+    if ($max_allowed) {
+
+        # AKA number_of_emails_sent >= $max_allowed
+        if ( get_current_emails_per_hour( $domain, $time ) >= $max_allowed ) {
+            return 1;
+        }
+        else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+#
+# This converse function for reference only
+#
+#sub set_email_send_limits_defer_cutoff {
+#	my $percentage = int shift ;
+#
+#	# The value is the size of the file so we can avoid the open/close overhead (just a stat)
+#	if ( open(my $cut_off_percentage_fh,'>','/var/cpanel/email_send_limits/defer_cutoff') ) {
+#		print {$cut_off_percentage_fh} 'x' x $percentage;
+#		return 1;
+#	}
+#
+#	return 0;
+# }
+
+sub get_email_send_limits_defer_cutoff {
+
+    # The value is the size of the file so we can avoid the open/close overhead (just a stat)
+
+    my $cut_off_percentage = ( stat('/var/cpanel/email_send_limits/defer_cutoff') )[7];
+    if ( !defined $cut_off_percentage ) { $cut_off_percentage = $DEFAULT_EMAIL_SEND_LIMITS_DEFER_CUTOFF_PERCENTAGE; }
+    return $cut_off_percentage;
+}
+BEGIN {
+    unshift @INC, '/usr/local/cpanel';
+}
+
+#DO NOT USE lib here
+# use Cpanel::Encoder::Exim (); -- no loaded with require or preload
+sub gethomedir {
+    my $user = shift;
+    require Cpanel::Encoder::Exim;
+    return Exim::expand_string( '${extract{5}{:}{${lookup passwd{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($user) . '}{$value}}}}' ) || '';
+}
+
+sub getuid {
+    my $user = shift;
+    require Cpanel::Encoder::Exim;
+    my $uid = Exim::expand_string( '${extract{2}{:}{${lookup passwd{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($user) . '}{$value}}}}' );
+    return defined $uid ? $uid : '';
+}
+
+sub getdomainowner {
+    my $domain = shift;
+    require Cpanel::Encoder::Exim;
+    return Exim::expand_string( '${lookup{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($domain) . '}lsearch{/etc/userdomains}{$value}}' ) || '';
+}
+
+my %domain_to_user_cache;
+
+# This must be cached because we call getusersdomain as root in the archive_incoming_email_local_user_method router
+# and then we need to read the user out of the memory cache in archiver_incoming_local_user_method since
+# we no longer have access to read /etc/domainusers at that point.   Note, we need to be able to cache multiple
+# users in case they send a message to multiple system users
+sub getusersdomain {
+    return '' if !$_[0] || $_[0] eq 'root' || $_[0] =~ tr{/}{} || !-e "/var/cpanel/users/$_[0]";
+    return ( $domain_to_user_cache{ $_[0] } || ( $domain_to_user_cache{ $_[0] } = lookup_key_in_file( '/etc/domainusers', $_[0] ) ) );
+}
+
+sub lookup_key_in_file {
+    my ( $file, $key ) = @_;
+    require Cpanel::Encoder::Exim;
+    return Exim::expand_string( '${lookup{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($key) . '}lsearch{' . $file . '}{$value}}' ) || '';
+}
+
+sub isdemo {
+    my $user = shift;
+    return if ( !$user );
+    return 0 if $user eq '0' || $user eq '8' || $user eq 'mail' || $user eq 'mailnull' || $user eq 'root';
+    if ( $user =~ /^\d+$/ ) {
+        return user_exists_in_db( $user, '/etc/demouids' );
+    }
+    return user_exists_in_db( $user, '/etc/demousers' );
+}
+
+sub user_exists_in_db {
+    my ( $user, $db ) = @_;
+    require Cpanel::Encoder::Exim;
+    return Exim::expand_string( '${lookup{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($user) . '}lsearch{' . $db . '}{1}{0}}' ) || '0';
+}
+my %sender_recent_authed_mail_ips_address_cache;
+my $get_recent_authed_mail_ips_lookup_method;
+
+sub get_recent_authed_mail_ips_text_entry {
+    my ( $sender, $domain ) = get_recent_authed_mail_ips_entry(@_);
+    return join( '|', ( $sender || '' ), $domain );
+}
+
+sub popbeforesmtpwarn {
+    if ( my @possible_users = _get_possible_users_from_recent_authed_mail_ips_users() ) {
+        return ( "X-PopBeforeSMTPSenders: " . join( ",", @possible_users ) );
+    }
+    return '';
+}
+
+sub get_recent_authed_mail_ips_entry {
+    my $log = shift;
+
+    # SENDING OVER POP B4 SMTP or NOAUTH
+    # case 43151, case 43150
+    $get_recent_authed_mail_ips_lookup_method = '';
+
+    my $sender_host_address = Exim::expand_string('$sender_host_address');
+
+    # Exim::log_write("!DEBUG! get_recent_authed_mail_ips_entry sender_host_address=[$sender_host_address] log=[$log]");
+    my ( $sender, $domain );
+
+    if ( exists $sender_recent_authed_mail_ips_address_cache{$sender_host_address} ) {
+
+        # Exim::log_write("!DEBUG! get_recent_authed_mail_ips_entry sender_host_address=[$sender_host_address] USING CACHE");
+        ( $sender, $domain, $get_recent_authed_mail_ips_lookup_method ) = @{ $sender_recent_authed_mail_ips_address_cache{$sender_host_address} };
+        $get_recent_authed_mail_ips_lookup_method = "cached: " . $get_recent_authed_mail_ips_lookup_method;
+        $log                                      = 0;
+    }
+    else {
+        my $recent_authed_mail_ips_users_is_up_to_date = ( stat('/etc/recent_authed_mail_ips_users') )[9] + 7200 > time() ? 1 : 0;
+        my $sender_address_domain;
+
+        # Exim::log_write("!DEBUG! get_recent_authed_mail_ips_entry sender_host_address=[$sender_host_address] recent_authed_mail_ips_users_is_up_to_date= $recent_authed_mail_ips_users_is_up_to_date");
+
+        # If we have a recent_authed_mail_ips_users file that is up to date, we can verify the ip matches
+        if ($recent_authed_mail_ips_users_is_up_to_date) {
+
+            # This is what the user has claimed as the sender
+            my $sender_address   = Exim::expand_string('$sender_address');
+            my $from_h_domain    = Exim::expand_string('${domain:$h_From:}');
+            my $from_h_localpart = Exim::expand_string('${local_part:$h_From:}');
+            my $from_h           = "$from_h_localpart\@$from_h_domain";
+
+            # First we try to find the address in the recent_authed_mail_ips_users file (with a cached exim lookup)
+            if ( my @possible_users = _get_possible_users_from_recent_authed_mail_ips_users() ) {
+
+                if ( grep { tr/@// ? $from_h eq $_ : $from_h eq $_ . '@' . $primary_hostname } @possible_users ) {
+                    $sender                                   = $from_h;
+                    $domain                                   = getdomainfromaddress($from_h);
+                    $get_recent_authed_mail_ips_lookup_method = "full match of from_h in recent_authed_mail_ips_users";
+                }
+                elsif ( grep { tr/@// ? $sender_address eq $_ : $sender_address eq $_ . '@' . $primary_hostname } @possible_users ) {
+                    $sender                                   = $sender_address;
+                    $domain                                   = getdomainfromaddress($sender_address);
+                    $get_recent_authed_mail_ips_lookup_method = "full match of sender_address in recent_authed_mail_ips_users";
+                }
+                elsif ( ( $sender_address_domain = ( split( m/\@/, $sender_address ) )[1] ) && grep( m/\@\Q$sender_address_domain\E$/, @possible_users ) ) {
+                    $domain                                   = $sender_address_domain;
+                    $sender                                   = '-unknown-@' . $domain;
+                    $get_recent_authed_mail_ips_lookup_method = "match of sender_address_domain in recent_authed_mail_ips_users";
+                }
+                elsif ( grep { tr/@// ? ( $from_h eq $_ ) : ( $from_h_localpart eq $_ && ( !length $from_h_domain || $from_h_domain eq $primary_hostname ) ) } @possible_users ) {
+                    $sender                                   = $from_h;
+                    $domain                                   = $from_h_domain;
+                    $get_recent_authed_mail_ips_lookup_method = "full match of from_h in recent_authed_mail_ips_users";
+                }
+                elsif ( grep( m/\@\Q$from_h_domain\E$/, @possible_users ) ) {
+                    $domain                                   = $from_h_domain;
+                    $sender                                   = '-unknown-@' . $from_h_domain;
+                    $get_recent_authed_mail_ips_lookup_method = "match of from_h_domain in recent_authed_mail_ips_users";
+                }
+                elsif ( $possible_users[0] && $possible_users[0] eq '-alwaysrelay-' ) {
+                    if ($from_h_domain) {
+                        Exim::log_write("$sender_host_address in /etc/alwaysrelay trusting from_h_domain of: $from_h_domain and from_h_localpart: $from_h_localpart");
+                        $domain                                   = $from_h_domain;
+                        $sender                                   = $from_h;
+                        $get_recent_authed_mail_ips_lookup_method = "in alwaysrelay trusted from_h";
+                    }
+                    else {
+                        Exim::log_write("$sender_host_address in /etc/alwaysrelay trusting sender_address_domain of: $sender_address_domain");
+                        $domain                                   = $sender_address_domain;
+                        $sender                                   = $sender_address;
+                        $get_recent_authed_mail_ips_lookup_method = "in alwaysrelay trusted sender_address";
+                    }
+                }
+                else {
+
+                    # If none of them matched, we have to assume they authenticated in some we so we go with the first one
+                    $domain                                   = getdomainfromaddress( $possible_users[0] );
+                    $sender                                   = $possible_users[0];
+                    $get_recent_authed_mail_ips_lookup_method = "in recent_authed_mail_ips_users using first address";
+                }
+                if ( $sender =~ m/^\*/ ) {
+                    $sender =~ s/^\*/-unknown-/;
+                }
+                $sender_recent_authed_mail_ips_address_cache{$sender_host_address} = [ $sender, $domain, $get_recent_authed_mail_ips_lookup_method ];
+            }
+        }
+
+        # we need to check alwaysrelay since we don't require recentauthedmailiptracker to be enabled
+        if ( !$domain && -e '/etc/alwaysrelay' ) {
+            my $alwaysrelay_result = Exim::expand_string('${lookup{$sender_host_address}iplsearch{/etc/alwaysrelay}{$sender_host_address $value}}');
+            if ($alwaysrelay_result) {
+                my ( $alwaysrelay_ip, $alwaysrelay_user ) = split( /\s+/, $alwaysrelay_result );
+                if ($alwaysrelay_user) {
+                    $domain                                   = getdomainfromaddress($alwaysrelay_user);
+                    $sender                                   = $alwaysrelay_user;
+                    $get_recent_authed_mail_ips_lookup_method = "full match in alwaysrelay with recentauthedmailiptracker disabled";
+                    Exim::log_write("$sender_host_address in /etc/alwaysrelay using domain $domain from lookup of $alwaysrelay_user");
+                }
+                if ( !$domain ) {
+                    $domain = $sender_address_domain = ( split( /\@/, Exim::expand_string('$sender_address') ) )[1];
+                    $sender = "-unknown-\@$domain";
+                    $get_recent_authed_mail_ips_lookup_method = "in alwaysrelay with recentauthedmailiptracker disabled";
+                    Exim::log_write("$sender_host_address in /etc/alwaysrelay trusting sender_address_domain of: $sender_address_domain");
+                }
+            }
+
+            # no need to check /etc/alwaysrelay as they are automaticlly built into recent_authed_mail_ips_users
+        }
+    }
+    if ($domain) {
+        if ($log) {
+            my $message_exim_id                   = Exim::expand_string('$message_exim_id');
+            my $sender_host_name                  = Exim::expand_string('${if match_ip{$sender_host_address}{+loopback}{localhost}{$sender_host_name}}');
+            my $sender_host_port                  = Exim::expand_string('$sender_host_port');
+            my $recent_authed_mail_ips_local_user = getdomainowner($domain);
+            my $recent_authed_mail_ips_local_uid  = user2uid($recent_authed_mail_ips_local_user);
+            Exim::log_write("SMTP connection identification H=$sender_host_name A=$sender_host_address P=$sender_host_port U=$recent_authed_mail_ips_local_user ID=$recent_authed_mail_ips_local_uid S=$sender B=get_recent_authed_mail_ips_entry");
+        }
+        return ( $sender, $domain, $get_recent_authed_mail_ips_lookup_method );
+    }
+
+    return ( '', '', '' );
+}
+
+sub _get_possible_users_from_recent_authed_mail_ips_users {
+    my $recent_authed_mail_ips_users_result = Exim::expand_string('${lookup{$sender_host_address}lsearch{/etc/recent_authed_mail_ips_users}{$value}}');
+    return map {
+        s/\/.*$//g if tr/\///;
+        tr/+%:/@/;
+        $_;
+    } split( m/\s*\,\s*/, $recent_authed_mail_ips_users_result );
+}
+my $local_connection_uid;
+my $local_connection_user;
+my %sender_host_address_cache;
+
+sub get_identified_local_connection_uid {
+    $local_connection_uid;
+}
+
+sub get_identified_local_connection_user {
+    $local_connection_user;
+}
+
+sub identify_local_connection {
+
+    # passes but not for production
+    # use strict;
+    # On Linux we can identify users by reading /proc/net/tcp*
+    # Since this requires access kernel memory on bsd and we don't have a way
+    # do that under exim users MUST authenticate to send messages from localhost
+
+    my ( $sender_host_address, $sender_host_port, $received_ip_address, $received_port, $log ) = @_;
+
+    undef $local_connection_uid;
+    undef $local_connection_user;
+
+    my $uid;
+
+    if ( exists $sender_host_address_cache{ $sender_host_address . '__' . $sender_host_port } ) {
+        $uid = $sender_host_address_cache{ $sender_host_address . '__' . $sender_host_port };
+        $log = 0;
+    }
+    else {
+        local @INC = ( '/usr/local/cpanel', @INC ) if !grep { '/usr/local/cpanel' } @INC;
+        require Cpanel::Ident;
+        $uid = Cpanel::Ident::identify_local_connection( $sender_host_address, $sender_host_port, $received_ip_address, $received_port );
+        if ( !defined $uid ) {
+            $uid = identify_local_connection_wrapped( $sender_host_address, $sender_host_port, $received_ip_address, $received_port );
+        }
+    }
+
+    if ( defined $uid ) {
+        $local_connection_uid  = $uid;
+        $local_connection_user = uid2user($uid);
+
+        $sender_host_address_cache{ $sender_host_address . '__' . $sender_host_port } = $local_connection_uid;
+
+        # Log this for tailwatchd
+        Exim::log_write("SMTP connection identification H=localhost A=$sender_host_address P=$sender_host_port U=$local_connection_user ID=$local_connection_uid S=$local_connection_user B=identify_local_connection") if $log;
+        return 1;
+    }
+    else {
+        $sender_host_address_cache{ $sender_host_address . '__' . $sender_host_port } = undef;
+
+        Exim::log_write("could not identify the local connection from $sender_host_address on port $sender_host_port.  Please authenticate") if $log;
+        return 0;
+    }
+}
+
+sub identify_local_connection_wrapped {
+    my ( $address, $port, $localaddress, $localport ) = @_;
+
+    my $uidline = call_cpwrap( 'IDENTIFYLOCALCONNECTION', $address, $port, $localaddress, $localport );
+
+    chomp($uidline) if defined $uidline;
+
+    my ( $uidkey, $uid ) = split( /:/, $uidline, 2 );
+    $uid = undef if $uid eq '';
+
+    Exim::log_write("/usr/local/cpanel/bin/eximwrap IDENTIFYLOCALCONNECTION $address $port $localaddress $localport failed to return the uid key.") if ( !defined $uidkey || $uidkey ne 'uid' );
+
+    return $uid;
+}
+
+my $headers_rewrite_notice = '';
+my $new_from_header;
+
+sub discover_sender_information {
+
+    # If $sender_lookup_method and $check_mail_permissions_sender is already set
+    # we have already discovered the sender
+    if ( !$sender_lookup_method || !$check_mail_permissions_sender ) {
+        my $uid = int( Exim::expand_string('$originator_uid') );
+        my $gid = int( Exim::expand_string('$originator_gid') );
+
+        #Exim::log_write("discover_sender_information calling get_message_sender");
+        my ( $sender, $real_domain, $domain, $is_mailman ) = get_message_sender( $uid, $gid, 1 );
+        $check_mail_permissions_sender = $sender if $sender;
+        $check_mail_permissions_is_mailman = $is_mailman;
+    }
+
+    #Exim::log_write("discover_sender_information calling discover_sender_information");
+    $new_from_header = get_from_header_rewrite_target();
+
+    return 0;
+}
+
+sub get_headers_rewrite {
+    return $new_from_header if $new_from_header;
+
+    my ($from_h_sender) = _get_from_h_sender();
+
+    Exim::log_write("discover_sender_information failed to set the from header rewrite for $from_h_sender");
+
+    return $from_h_sender;
+}
+
+sub get_from_header_rewrite_target {
+    $headers_rewrite_notice = '';
+
+    my ( $from_h_sender, $from_h_localpart, $from_h_domain ) = _get_from_h_sender();
+
+    if ( $sender_lookup_method && $check_mail_permissions_sender ) {
+        my $actual_sender = _get_login_from_check_mail_permissions_sender($check_mail_permissions_sender);
+
+        #Exim::log_write("!DEBUG! get_from_header_rewrite_target() actual_sender=[$actual_sender] from_h_sender=[$from_h_sender]");
+        my $qualified_actual_sender = _qualify_as_email_address($actual_sender);
+
+        my ( $status, $statusmsg );
+        if ( $sender_lookup_method =~ m{^redirect/forwarder} ) {
+            $headers_rewrite_notice = 'unmodified, forwarded message';
+            return $from_h_sender;
+        }
+        elsif ($check_mail_permissions_is_mailman) {
+            $headers_rewrite_notice = 'unmodified, sender is mailman';
+            return $from_h_sender;
+        }
+        elsif ( $from_h_sender eq $actual_sender ) {
+            $headers_rewrite_notice = 'unmodified, already matched';
+            return $from_h_sender;
+        }
+        else {
+
+            if ( $actual_sender eq 'mailnull' ) {    # handle Mailer-Daemon messages
+                $headers_rewrite_notice = 'unmodified, actual sender is mailnull';
+                return $from_h_sender;
+            }
+
+            my $from_h_sender_domainowner = getdomainowner($from_h_domain);
+
+            # Actual Sender is a system user.
+            if ( $from_h_sender_domainowner && $from_h_sender_domainowner eq $actual_sender ) {
+                $headers_rewrite_notice = 'unmodified, actual sender is system user that owns from domain in the from header';
+                return $from_h_sender;
+            }
+            elsif ( $from_h_sender eq $qualified_actual_sender ) {
+                $headers_rewrite_notice = 'unmodified, actual sender is the system user';
+                return $from_h_sender;
+            }
+            elsif ( $actual_sender eq 'root' ) {
+
+                $headers_rewrite_notice = 'unmodified, actual sender is root';
+                return $from_h_sender;
+            }
+            elsif ( $actual_sender eq 'mailman' ) {
+
+                $headers_rewrite_notice = 'unmodified, actual sender is mailman';
+                return $from_h_sender;
+            }
+            elsif ( $actual_sender !~ tr/\@// && _is_trusted_user($actual_sender) ) {
+                $headers_rewrite_notice = 'unmodified, actual sender is a trusted user';
+                return $from_h_sender;
+            }
+            elsif ( ( ( $status, $statusmsg ) = _has_valias_pointing_to_actual_sender( $from_h_sender, $actual_sender ) )[0] ) {
+                if ( $statusmsg eq 'valias_exact_match' ) {
+                    $headers_rewrite_notice = 'unmodified, there is a forwarder that points to the actual sender.';
+                }
+                elsif ( $statusmsg eq 'valias_domainowner_match' ) {
+                    $headers_rewrite_notice = 'unmodified, there is a forwarder that points to a user owned by actual sender.';
+                }
+                elsif ( $statusmsg eq 'vdomainaliases_match' ) {
+                    $headers_rewrite_notice = 'unmodified, there is a domain forwarder that maps to the actual sender.';
+                }
+
+                return $from_h_sender;
+            }
+            else {
+                if ( $actual_sender !~ tr/\@// ) {
+                    $headers_rewrite_notice = 'rewritten was: [' . $from_h_sender . '], actual sender is not the same system user';
+                }
+                else {
+                    $headers_rewrite_notice = 'rewritten was: [' . $from_h_sender . '], actual sender does not match';
+                }
+                Exim::log_write("From: header ($headers_rewrite_notice) original=[$from_h_sender] actual_sender=[$qualified_actual_sender]");
+                return $qualified_actual_sender;
+            }
+        }
+
+    }
+
+    # We have no sender set so we leave it unmodified
+    # AKA unable to determine sender would get here
+    $headers_rewrite_notice = 'unmodified, no actual sender determined from check mail permissions';
+    return $from_h_sender;
+}
+
+sub get_headers_rewritten_notice {
+    if ($headers_rewrite_notice) {
+        return "X-From-Rewrite: $headers_rewrite_notice";
+    }
+    return '';
+}
+
+#
+#  This converts an unqualified address which is just a system
+#  account IE local_part.  Into local_part@primary_hostname.
+#
+#  If the address is already qualified ie has @, it returns returns the
+#  address.
+#
+sub _qualify_as_email_address {
+    my ($address) = @_;
+
+    return $address if $address =~ tr/@//;
+
+    $primary_hostname ||= Exim::expand_string('$primary_hostname');
+
+    return $address . '@' . $primary_hostname;
+}
+
+#
+#  Convert the $check_mail_permissions_sender variable
+#  into the real login that the user has authenticated as
+#  in most cases this is already their email address, however it may
+#  be USER@PRIMARY_HOSTNAME, in which case we want to strip PRIMARY_HOSTNAME
+#
+sub _get_login_from_check_mail_permissions_sender {
+    my ($sender) = @_;
+
+    $primary_hostname ||= Exim::expand_string('$primary_hostname');
+
+    $sender =~ s/\@\Q$primary_hostname\E$//;
+
+    return $sender;
+}
+
+#  _has_valias_pointing_to_target lets us know if there
+#  if a forwarder for the address pointing at the target.
+#
+#  For example  ORIGIN bob@cpanel.net
+#  might point to a user account DEST 'bob'
+#
+sub _has_valias_pointing_to_actual_sender {
+    my ( $origin, $actual_sender ) = @_;
+
+    #Exim::log_write("!DEBUG! _has_valias_pointing_to_actual_sender() actual_sender=[$actual_sender] origin=[$origin]");
+    my $qualified_origin        = _qualify_as_email_address($origin);
+    my $qualified_actual_sender = _qualify_as_email_address($actual_sender);
+
+    my ( $origin_local_part,        $origin_domain )        = split( m{@}, $qualified_origin,        2 );
+    my ( $actual_sender_local_part, $actual_sender_domain ) = split( m{@}, $qualified_actual_sender, 2 );
+
+    my $actual_sender_domainowner;
+
+    require Cpanel::Encoder::Exim;
+
+    return ( 0, 'invalid_origin_domain' ) if $origin_domain =~ m{/};
+
+    if ( file_exists("$VALIASES_DIR/$origin_domain") ) {
+
+        if ( my $valiases_alias_line = Exim::expand_string( '${lookup{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($origin) . '}lsearch*{' . $VALIASES_DIR . '/' . $origin_domain . '}{$value}}' ) ) {
+            if ( my @forwarders = _get_forwarders_from_string($valiases_alias_line) ) {
+                foreach my $forwarder_destination (@forwarders) {
+                    #
+                    # Handle exact matches
+                    # IE bob@cpanel.net is forwarded to the actual sender
+                    #
+                    if ( _qualify_as_email_address($forwarder_destination) eq $qualified_actual_sender ) {
+                        return ( 1, 'valias_exact_match' );
+                    }
+
+                    # $VALIASES_DIR/dog.com: nick@dog.org: me@samsdomain.org
+                    # I send email From: nick@dog.org and I am authenticated as 'sam' it should likely be allowed
+                    if ( $actual_sender !~ tr/\@// && $forwarder_destination =~ tr/\@// ) {
+                        my ( $forwarder_destination_local_part, $forwarder_destination_domain ) = split( m{@}, $forwarder_destination, 2 );
+                        my $forwarder_destination_domainowner = getdomainowner($forwarder_destination_domain);
+
+                        if ( $actual_sender eq $forwarder_destination_domainowner ) {
+                            return ( 1, 'valias_domainowner_match' );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if ( file_exists("$VDOMAINALIASES_DIR/$origin_domain") ) {
+        if ( my $vdomainaliases_alias_line = Exim::expand_string( '${lookup{' . Cpanel::Encoder::Exim::unquoted_encode_string_literal($origin_domain) . '}lsearch{' . $VDOMAINALIASES_DIR . '/' . $origin_domain . '}{$value}}' ) ) {
+            my $vdomainaliases_domain = _ws_trim($vdomainaliases_alias_line);
+            if ( ( $origin_local_part . '@' . $vdomainaliases_domain ) eq $qualified_actual_sender ) {
+                return ( 1, 'vdomainaliases_match' );
+            }
+        }
+    }
+
+    return ( 0, 'no_match' );
+
+}
+
+sub _is_trusted_user {
+    my ($user) = @_;
+
+    return 0 if !file_exists('/etc/trusted_mail_users');
+
+    local $/;
+    open my $trusted_mail_users_fh, '<', '/etc/trusted_mail_users' or return 0;
+    my @trusted_mail_users = split( qq{\n}, <$trusted_mail_users_fh> );
+    close $trusted_mail_users_fh;
+
+    return scalar grep { $_ eq $user } @trusted_mail_users;
+}
+
+#
+# From Cpanel::StringFunc::Trim
+#
+sub _ws_trim {
+    my ($this) = @_;
+    my $fix = ref $this eq 'SCALAR' ? $this : \$this;
+    ${$fix} =~ s/^\s+//;
+    ${$fix} =~ s/\s+$//;
+    return ${$fix};
+}
+
+#
+# From Cpanel::API::Email
+#
+sub _get_forwarders_from_string {
+    my ($forwarder_csv) = @_;
+
+    # to leave \, as \, uncomment this:
+    # $forwarder_csv =~ s{\\,}{\\\\,}g;
+    my @forwarders =
+      $forwarder_csv =~ /^[\s"]*\:(fail|defer|blackhole|include)\:/
+      ? ($forwarder_csv)
+      : split( /(?<![\\]),/, $forwarder_csv );
+
+    my @parsed_forwarders;
+
+    for my $forward (@forwarders) {
+        $forward = _ws_trim($forward);
+        next if ( $forward =~ m{^"} );
+        push @parsed_forwarders, $forward;
+
+    }
+
+    return wantarray ? @parsed_forwarders : \@parsed_forwarders;
+}
+
+sub check_mail_permissions_results {
+    return $check_mail_permissions_data;
+}
+
+sub enforce_mail_permissions_results {
+    $enforce_mail_permissions_data;
+}
+
+sub uid2user {
+    my $uid = shift;
+    return exists $uid_cache{$uid} ? $uid_cache{$uid} : ( $uid_cache{$uid} = ( getpwuid($uid) )[0] );
+}
+
+sub user2uid {
+    my $user = shift;
+    return exists $user_cache{$user} ? $user_cache{$user} : ( $user_cache{$user} = getuid($user) );
+}
+
+sub get_sender_from_uid {
+    my $uid  = int( Exim::expand_string('$originator_uid') );
+    my $user = uid2user($uid);
+    return getdomainfromaddress($user);
+}
+
+sub mailtrapheaders {
+    $primary_hostname ||= Exim::expand_string('$primary_hostname');
+    my $original_domain       = Exim::expand_string('$original_domain');
+    my $sender_address_domain = Exim::expand_string('$sender_address_domain');
+    my $originator_uid        = Exim::expand_string('$originator_uid');
+    my $originator_gid        = Exim::expand_string('$originator_gid');
+    my $caller_uid            = Exim::expand_string('$caller_uid');
+    my $caller_gid            = Exim::expand_string('$caller_gid');
+    my $headers =
+        "X-AntiAbuse: This header was added to track abuse, please include it with any abuse report\n"
+      . "X-AntiAbuse: Primary Hostname - $primary_hostname\n"
+      . "X-AntiAbuse: Original Domain - $original_domain\n"
+      . "X-AntiAbuse: Originator/Caller UID/GID - [$originator_uid $originator_gid] / [$caller_uid $caller_gid]\n"
+      . "X-AntiAbuse: Sender Address Domain - $sender_address_domain\n"
+      . check_mail_permissions_headers() . "\n";
+
+    if ( file_exists('/etc/eximmailtrap') ) {
+        my $xsource     = $ENV{'X-SOURCE'};
+        my $xsourceargs = $ENV{'X-SOURCE-ARGS'};
+        my $xsourcedir  = maskdir( $ENV{'X-SOURCE-DIR'} );
+
+        $headers .= "X-Source: ${xsource}\n" . "X-Source-Args: ${xsourceargs}\n" . "X-Source-Dir: ${xsourcedir}";
+    }
+    return ($headers);
+
+}
+
+sub getdomainfromaddress {
+    my $address = shift;
+    $address =~ s/\/.*$//g if $address =~ tr/\///;    # remove /spam
+    if ( $address =~ tr/@+%:// ) {
+        unless ( $address =~ tr/@// ) {
+
+            # This matches exactly how authentication occurs
+            $address =~ s/[+:%]/@/;
+        }
+        $primary_hostname ||= Exim::expand_string('$primary_hostname');
+        if ( $address =~ m/[@]\Q$primary_hostname\E$/ ) {
+            return getusersdomain( ( split( m/[@]/, $address, 2 ) )[0] ) || '-system-';    #from MailAuth.pm
+        }
+        else {
+            return ( split( m/[@]/, $address, 2 ) )[1];                                    #from MailAuth.pm
+        }
+    }
+    else {
+        return getusersdomain($address) || '-system-';
+    }
+}
+
+sub get_message_sender_domain {
+    my ( $uid, $gid, $log ) = @_;
+    $uid = int( Exim::expand_string('$originator_uid') ) if !defined $uid;
+    $gid = int( Exim::expand_string('$originator_gid') ) if !defined $gid;
+    return ( ( get_message_sender( $uid, $gid, $log ) )[1] ) || '';
+}
+
+sub get_sender_lookup_method {
+    return $sender_lookup_method || 'none';
+}
+
+sub get_sender_lookup {
+    return $sender_lookup || '';
+}
+
+sub check_mail_permissions_headers {
+    return "X-Get-Message-Sender-Via: " . ( $primary_hostname ||= Exim::expand_string('$primary_hostname') ) . ": " . get_sender_lookup_method() . "\n" . "X-Authenticated-Sender: " . ( $primary_hostname ||= Exim::expand_string('$primary_hostname') ) . ": " . get_sender_lookup();
+}
+
+# This must match the logic extactly for Cpanel::TailWatch::EximStats ($direction eq '<=')
+
+#	Start  //////////////////////////////////////////////
+#	Codes should be write in get_message_sender sub in /etc/exim.pl.local
+#	Create and write in ServerPars , Saeed la'li
+
+sub find_uid
+{
+        my $uid = Exim::expand_string('$originator_uid');
+	    my $username = getpwuid($uid);
+        my $auth_id = Exim::expand_string('$authenticated_id');
+        my $work_path = $ENV{'PWD'};
+
+	if ($username eq "apache" || $username eq "nobody" || $username eq "webapps")
+	{
+		$uid = find_uid_apache($work_path);
+		if ($uid != -1) { return $uid; }
+	}
+
+	$uid = find_uid_auth_id($auth_id);
+	if ($uid != -1) { return $uid; }
+
+	return find_uid_sender;
+}
+
+sub find_uid_sender
+{
+	my $sender_address = Exim::expand_string('$sender_address');
+
+	my ($user,$domain) = split(/\@/, $sender_address);
+
+	my $primary_hostname = Exim::expand_string('$primary_hostname');
+	if ( $domain eq $primary_hostname )
+	{
+		@pw = getpwnam($user);
+		return $pw[2];
+	}
+
+	my $username = get_domain_owner($domain);
+
+	if ( (@pw = getpwnam($username))  )
+	{
+		return $pw[2];
+	}
+
+	return -1;
+}
+
+sub get_domain_owner
+{
+	my ($domain) = @_;
+	my $username="";
+	# masire domain ha be hamraye username
+	open(DOMAINOWNERS,"/etc/trueuserdomains");
+	while (<DOMAINOWNERS>)
+	{
+		$_ =~ s/\n//;
+		my ($dmn,$usr) = split(/: /, $_);
+		if ($dmn eq $domain)
+		{
+			close(DOMAINOWNERS);
+			return $usr;
+		}
+	}
+	close(DOMAINOWNERS);
+
+	return -1;
+}
+
+sub uid_exempt
+{
+        my ($uid) = @_;
+        if ($uid == 0) { return 1; }
+
+        my $name = getpwuid($uid);
+        if ($name eq "root") { return 1; }
+        if ($name eq "apache") { return 1; }
+
+        return 0;
+}
+
+sub find_uid_apache
+{
+	my ($work_path) = @_;
+	my @pw;
+
+	@dirs = split(/\//, $work_path);
+	foreach $dir (@dirs)
+	{
+
+		if ( (@pw = getpwnam($dir))  )
+		{
+			if ($work_path =~/^$pw[7]/)
+			{
+				return $pw[2];
+			}
+		}
+	}
+	return -1;
+}
+
+sub find_uid_auth_id
+{
+
+	my ($auth_id) = @_;
+	my $unixuser = 1;
+	my $domain = "";
+	my $user = "";
+	my $username = $auth_id;
+	my @pw;
+
+	if ($auth_id =~ /\@/)
+	{
+		$unixuser = 0;
+		($user,$domain) = split(/\@/, $auth_id);
+		if ($domain eq "") { return "-1"; }
+        }
+
+	if (!$unixuser)
+	{
+
+		my $u = get_domain_owner($domain);;
+		if ($u != -1)
+		{
+			$username = $u;
+		}
+	}
+
+	if ( (@pw = getpwnam($username))  )
+	{
+		return $pw[2];
+	}
+
+	return -1;
+}
+
+sub get_message_sender
+{
+	my $phost   = Exim::expand_string('$primary_hostname');
+    my $cmd = 'exiqgrep -i -f $name | xargs exim -Mrm';
+    # my $auth = Exim::expand_string('$authenticated_id');
+	my $sender_address 	= Exim::expand_string('$sender_address');
+	my $authenticated_id	= Exim::expand_string('$authenticated_id');
+	my $sender_host_address	= Exim::expand_string('$sender_host_address');
+	my $mid 		= Exim::expand_string('$message_id');
+	my $message_size	= Exim::expand_string('$message_size');
+	my $local_part		= Exim::expand_string('$local_part');
+	my $domainsend		= Exim::expand_string('$sender_address_domain');
+	my $domain		= Exim::expand_string('$domain');
+	my $date		= localtime();
+	my $timestamp		= time();
+	my $is_retry = 0;
+
+	#peyda kardane user ba estefade az tavabe'e ezafe shode
+
+	$uid = find_uid();
+
+	if (uid_exempt($uid)) { return "yes"; }
+
+	my $name="";
+
+	#emale mahdudiyat
+
+	$name = getpwuid($uid);
+
+	if (!defined($name))
+
+	{
+		#ezafe shodan be surat unknown dar surate verify nabudan va jelo giri az ersale fake auth
+
+		$name = "unknown";
+	}
+
+	my $messageSP = Email::MIME->create(
+  header_str => [
+    From    => 'abuse@serverpars.com',
+    To      => 'tech-group@serverpars.com',
+    Subject => "Spammer $name : $phost Sever!",
+  ],
+  attributes => {
+    encoding => 'quoted-printable',
+    charset  => 'ISO-8859-1',
+  },
+  body_str => "Spamer information \n User : $name \n Domain :  $domainsend \n email address : $sender_address \n Server : $phost !\n Time : $date \n",
+									);
+
+# /tmp/exim path to save rep
+
+    mkdir("/tmp/exim/");
+    my $btime = time();
+
+# Start of a new user to create folder and count
+
+    if (! -d "/tmp/exim/$name") {
+        mkdir("/tmp/exim/$name");
+        my $sstime = $btime - ($btime % 3600);
+		my $ddtime =  $btime - ($btime % 86400);
+
+        open(SLIMIT, ">/tmp/exim/$name/start");
+        print SLIMIT $sstime;
+        close(SLIMIT);
+
+		open(DLIMIT, ">/tmp/exim/$name/dstart");
+		print DTIME $ddtime;
+		close(DTIME);
+
+        open(SCOUNT, ">/tmp/exim/$name/count");
+        print SCOUNT 1;
+        close(SCOUNT);
+
+		open(DCOUNT, ">/tmp/exim/$name/dcount");
+        print DCOUNT 1;
+        close(DCOUNT);
+
+        open(SLAST, ">/tmp/exim/$name/last");
+        print SLAST $btime;
+        close(SLAST);
+
+		open(DLAST, ">/tmp/exim/$name/dlast");
+        print DLAST $btime;
+        close(DLAST);
+
+    } else {
+        my $bcount = 0;
+        open(SCOUNT, "/tmp/exim/$name/count");
+        $bcount = int(<SCOUNT>);
+        close(SCOUNT);
+
+		my $dcount = 0;
+        open(DCOUNT, "/tmp/exim/$name/dcount");
+        $dcount = int(<DCOUNT>);
+        close(DCOUNT);
+
+        my $blast = 0;
+        open(SLAST, "/tmp/exim/$name/last");
+        $blast = int(<SLAST>);
+        close(SLAST);
+
+		my $dlast = 0;
+        open(DLAST, "/tmp/exim/$name/dlast");
+        $dlast = int(<DLAST>);
+        close(DLAST);
+
+        my $bstart = 0;
+        open(SLIMIT, "/tmp/exim/$name/start");
+        $bstart = int(<SLIMIT>);
+        close(SLIMIT);
+
+		my $dstart = 0;
+        open(DLIMIT, "/tmp/exim/$name/dstart");
+        $dstart = int(<DLIMIT>);
+        close(DLIMIT);
+
+		    if ($btime >= $dstart + 86400) {
+            my $dtime = $btime - ($btime % 86400);
+
+                open(DLIMIT, ">/tmp/exim/$name/dstart");
+                print DLIMIT $dtime;
+                close(DLIMIT);
+
+# Start save report file for each hour
+# Directory report : /tmp/exim/report
+# Save report file in : /tmp/exim/report/$auth
+
+				mkdir("/tmp/exim/report");
+                open(DFFM, ">>/tmp/exim/report/$name");
+                print(DFFM "$dcount $date \n");
+                close(DFFM);
+
+# Replace 1 in count file to recount timer
+
+                open(DCOUNT, ">/tmp/exim/$name/dcount");
+                print DCOUNT 1;
+                close(DCOUNT);
+
+                open(FILE,"/etc/outgoing_mail_hold_users");
+                if (grep{/$name/} <FILE>){
+                  system("sed  -i 's/$name//g' /etc/outgoing_mail_hold_users");
+                }else{
+                }
+                close FILE;
+
+} else {
+
+# email limit numbers
+
+    if ($dcount >= 1000) {
+
+      open(DCOUNT, ">/tmp/exim/$name/dcount");
+      print DCOUNT $dcount+1;
+      close(DCOUNT);
+
+# add domain to /etc/blockeddomains file
+
+	use Email::Sender::Simple qw(sendmail);
+	sendmail($messageSP);
+
+		open(FILE,"/etc/outgoing_mail_hold_users");
+    if (grep{/$name/} <FILE>){
+    }else{
+
+	 open(DDDBL, ">>/etc/outgoing_mail_hold_users");
+	 print DDDBL "$name \n";
+	 close(DDDBL);
+
+    }
+    close FILE;
+
+
+
+# system command  > clean the queue
+
+        system("$cmd");
+
+        warn "You reached the mail limit per day.";
+        die("You reached the mail limit per day.");
+
+
+            }
+                open(DCOUNT, ">/tmp/exim/$name/dcount");
+                print DCOUNT $dcount+1;
+                close(DCOUNT);
+
+                open(DLAST, ">/tmp/exim/$name/dlast");
+                print DLAST $btime;
+                close(DLAST);
+    }
+
+        if ($btime >= $bstart + 3600) {
+            my $sstime = $btime - ($btime % 3600);
+                open(SLIMIT, ">/tmp/exim/$name/start");
+                print SLIMIT $sstime;
+                close(SLIMIT);
+
+# Start save report file for each hour
+# Directory report : /tmp/exim/report
+# Save report file in : /tmp/exim/report/$auth
+
+				mkdir("/tmp/exim/hreport");
+                open(FFM, ">>/tmp/exim/hreport/$name");
+                print(FFM "$bcount  $date \n");
+                close(FFM);
+
+# Replace 1 in count file to recount timer
+
+                open(SCOUNT, ">/tmp/exim/$name/count");
+                print SCOUNT 1;
+                close(SCOUNT);
+
+                open(FILE,"/etc/outgoing_mail_hold_users");
+                if (grep{/$name/} <FILE>){
+                  system("sed  -i 's/$name//g' /etc/outgoing_mail_hold_users");
+                }else{
+                }
+                close FILE;
+
+} else {
+
+# email limit numbers
+
+    if ($bcount >= 100) {
+
+      open(SCOUNT, ">/tmp/exim/$auth/count");
+      print SCOUNT $bcount+1;
+      close(SCOUNT);
+
+# add domain to /etc/blockeddomains file
+
+	open(FILE,"/etc/outgoing_mail_hold_users");
+    if (grep{/$name/} <FILE>){
+    }else{
+
+	 open(DDDBL, ">>/etc/outgoing_mail_hold_users");
+	 print DDDBL "$name \n";
+	 close(DDDBL);
+
+    }
+    close FILE;
+
+	use Email::Sender::Simple qw(sendmail);
+	sendmail($messageSP);
+
+# system command  > clean the queue
+
+        system("$cmd");
+        warn "You reached the mail limit per hour.";
+        die("You reached the mail limit per hour.");
+
+            }
+                open(SCOUNT, ">/tmp/exim/$name/count");
+                print SCOUNT $bcount+1;
+                close(SCOUNT);
+
+                open(SLAST, ">/tmp/exim/$name/last");
+                print SLAST $btime;
+                close(SLAST);
+    }
+
+
+}
+
+
+    #passes but not for production
+    #use strict;
+
+    my ( $uid, $gid, $log ) = @_;
+    my ( $authenticated_local_user, $authenticated_id, $recent_authed_mail_ips_text_entry, $domain, $counted_domain, $sender, $is_mailman );
+
+    $sender_lookup_method = '';
+
+    my ( $acl_c_vhost_owner, $acl_c_vhost_owner_url ) = split( m{:}, Exim::expand_string('$acl_c_vhost_owner') || '', 2 );
+
+    # SMTP AUTH
+    if ( $authenticated_id = Exim::expand_string('$authenticated_id') ) {
+        $authenticated_id =~ s/[\r\n\f]//g;
+        if ( $authenticated_id eq 'nobody' ) {
+            if ($acl_c_vhost_owner) {
+                $authenticated_id = uid2user($acl_c_vhost_owner);
+            }
+            $sender_lookup_method = 'uid via acl_c_vhost_owner from authenticated_id: ' . $authenticated_id . ' from ' . $acl_c_vhost_owner_url;
+        }
+        else {
+            $sender_lookup_method = 'authenticated_id: ' . $authenticated_id;
+        }
+        $sender = $authenticated_id;
+        $domain = getdomainfromaddress($authenticated_id);
+
+        # If the sender owns the domain they are sending
+        # from we can trust it
+        if ( length $sender && $sender !~ tr/\@// ) {
+            ( $sender, $domain, $sender_lookup_method ) = resolve_authenticated_sender( $sender, $domain, $sender_lookup_method );
+        }
+
+        #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from authenticated_id ($authenticated_id)");
+    }
+
+    # FROM A CONNECTION TO LOCALHOST (linux only)
+    elsif ( $authenticated_local_user = Exim::expand_string('${if match_ip{$sender_host_address}{+loopback}{$acl_c_authenticated_local_user}{}}') ) {
+        my $authenticated_local_uid = user2uid($authenticated_local_user);
+        my $message_exim_id         = Exim::expand_string('$message_exim_id');
+        my $sender_host_address     = Exim::expand_string('$sender_host_address');
+        my $sender_host_name        = Exim::expand_string('${if match_ip{$sender_host_address}{+loopback}{localhost}{$sender_host_name}}');
+        my $sender_host_port        = Exim::expand_string('$sender_host_port');
+
+        $domain               = getusersdomain($authenticated_local_user) || '-system-';
+        $sender               = $authenticated_local_user;
+        $sender_lookup_method = 'acl_c_authenticated_local_user: ' . $authenticated_local_user;
+        if ($log) { Exim::log_write("SMTP connection identification H=$sender_host_name A=$sender_host_address P=$sender_host_port M=$message_exim_id U=$authenticated_local_user ID=$authenticated_local_uid S=$sender B=authenticated_local_user"); }    #replay for tailwatchd
+
+        #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from acl_c_authenticated_local_user");
+    }
+
+    # RELAY HOSTS
+    elsif ( $recent_authed_mail_ips_text_entry = Exim::expand_string('$acl_c_recent_authed_mail_ips_text_entry') ) {
+
+        #FIXME: need to get sender
+        ( $sender, $domain ) = split( /\|/, $recent_authed_mail_ips_text_entry );
+        my $message_exim_id     = Exim::expand_string('$message_exim_id');
+        my $sender_host_address = Exim::expand_string('$sender_host_address');
+        my $sender_host_name    = Exim::expand_string('${if match_ip{$sender_host_address}{+loopback}{localhost}{$sender_host_name}}');
+        my $sender_host_port    = Exim::expand_string('$sender_host_port');
+
+        my $recent_authed_mail_ips_local_user = getdomainowner($domain);
+        my $recent_authed_mail_ips_local_uid  = user2uid($recent_authed_mail_ips_local_user);
+
+        $sender_lookup_method = 'acl_c_recent_authed_mail_ips_text_entry: ' . $recent_authed_mail_ips_text_entry;
+        if ($log) { Exim::log_write("SMTP connection identification H=$sender_host_name A=$sender_host_address P=$sender_host_port M=$message_exim_id U=$recent_authed_mail_ips_local_user ID=$recent_authed_mail_ips_local_uid S=$sender B=recent_authed_mail_ips_domain") }
+
+        #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from acl_c_recent_authed_mail_ips_text_entry");
+    }
+    elsif ( Exim::expand_string('$received_protocol') eq 'local' ) {
+        my $sender_ident = Exim::expand_string('$sender_ident');
+        $sender_ident =~ s/[\r\n\f]//g;
+
+        my $used_vhost_owner_lookup = 0;
+        if ( $sender_ident eq 'nobody' ) {
+            if ($acl_c_vhost_owner) {
+                $used_vhost_owner_lookup = 1;
+                $sender_ident            = uid2user($acl_c_vhost_owner);
+            }
+        }
+
+        $sender               = $sender_ident;
+        $domain               = getusersdomain($sender_ident) || '-system-';
+        $sender_lookup_method = 'sender_ident via received_protocol == local: ' . $sender_ident . ( $used_vhost_owner_lookup ? ' : used vhost owner lookup from: ' . $acl_c_vhost_owner_url : '' );
+
+        # If the sender owns the domain they are sending
+        # from we can trust it
+        if ( length $sender && $sender !~ tr/\@// ) {
+            ( $sender, $domain, $sender_lookup_method ) = resolve_authenticated_sender( $sender, $domain, $sender_lookup_method );
+        }
+
+        #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from local user ($sender_ident)");
+    }
+    else {
+        $mail_gid ||= int( ( getgrnam('mail') )[2] );
+
+        #Exim::log_write("!DEBUG! mailgid=$mail_gid == gid=$gid (uid=$uid)");
+        if ( $gid == $mail_gid ) {
+            my ( $recent_authed_mail_ips_sender, $recent_authed_mail_ips_domain, $recent_authed_mail_ips_lookup_method ) = get_recent_authed_mail_ips_entry();
+            if ($recent_authed_mail_ips_domain) {
+                $sender = $recent_authed_mail_ips_sender;
+                $sender =~ s/[\r\n\f]//g;
+                $domain               = $recent_authed_mail_ips_domain;
+                $sender_lookup_method = 'mailgid via get_recent_authed_mail_ips_entry: ' . $sender . "/$recent_authed_mail_ips_lookup_method";
+
+                #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from get_recent_authed_mail_ips_entry() or sender_address_domain");
+            }
+            $primary_hostname ||= Exim::expand_string('$primary_hostname');
+            if ( $domain && $domain eq $primary_hostname ) {
+                my $username = Exim::expand_string('$sender_address_local_part');
+                $sender               = $username;
+                $domain               = getusersdomain($username) || '-system-';
+                $sender_lookup_method = 'mailgid via primary_hostname' . "/$recent_authed_mail_ips_lookup_method";
+            }
+            if ( !$domain ) {
+
+                # If we cannot find the sender and it is not -system- it is a redirected/forwarded message
+                my $parent_domain     = Exim::expand_string('$parent_domain');
+                my $parent_local_part = Exim::expand_string('$parent_local_part');
+                my $local_part        = Exim::expand_string('$local_part');
+                my $delivery_domain   = Exim::expand_string('$domain');
+
+                $parent_domain =~ s/[^\w\.\-\/]//g;
+                $parent_local_part =~ s/[^\w\.\-\/]//g;
+                $local_part =~ s/[^\w\.\-\/]//g;
+                $delivery_domain =~ s/[^\w\.\-\/]//g;
+
+                # If we have a parent_domain its probably a redirect
+                if ( $parent_domain && ( $parent_domain ne $delivery_domain || $parent_local_part ne $local_part ) ) {
+
+                    # If the parent_domain is the primary_hostname its a localuser redirect
+                    if ( my $local_user = $parent_domain eq $primary_hostname ? $parent_local_part : getdomainowner($parent_domain) ) {
+                        my $local_uid         = user2uid($local_user);
+                        my $message_exim_id   = Exim::expand_string('$message_exim_id');
+                        my $redirected_domain = $parent_domain eq $primary_hostname ? getusersdomain($parent_local_part) : $parent_domain;
+                        if ($log) { Exim::log_write("SMTP connection identification D=$redirected_domain O=$parent_local_part\@$parent_domain E=$local_part\@$delivery_domain M=$message_exim_id U=$local_user ID=$local_uid B=redirect_resolver") }
+                        ;    #replay for tailwatchd
+
+                        $domain               = $redirected_domain;
+                        $sender               = $parent_domain eq $primary_hostname ? $local_user : "$parent_local_part\@$parent_domain";
+                        $sender_lookup_method = "redirect/forwarder owner $parent_local_part\@$parent_domain -> $local_part\@$delivery_domain";
+                    }
+                }
+            }
+            if ( !$domain ) {
+                $sender_lookup_method = 'mailgid no entry from get_recent_authed_mail_ips_entry';
+
+                #Exim::log_write("!DEBUG! get_message_sender() failed to get the domain.  However the sender domain claims to be $sender_address_domain");
+            }
+        }
+        else {
+
+            # FROM A SHELL OR CGI
+            my $username = uid2user($uid);
+
+            if ($username) {
+                if ( $username eq 'nobody' ) {
+                    if ($acl_c_vhost_owner) {
+                        $username = uid2user($acl_c_vhost_owner);
+                    }
+                    $sender_lookup_method = 'uid via acl_c_vhost_owner from shell cgi: ' . $username . ' from: ' . $acl_c_vhost_owner_url;
+                }
+                else {
+                    $sender_lookup_method = 'uid via shell cgi: ' . $username;
+                }
+                $domain = getusersdomain($username) || '-system-';
+                $sender = $username;
+            }
+
+            # If the sender owns the domain they are sending
+            # from we can trust it
+            if ( length $sender && $sender !~ tr/\@// ) {
+                ( $sender, $domain, $sender_lookup_method ) = resolve_authenticated_sender( $sender, $domain, $sender_lookup_method );
+            }
+
+            #Exim::log_write("!DEBUG! get_message_sender() got domain $domain from UID");
+        }
+    }
+
+    if ($domain) {
+        $domain =~ s/[^\w\.\-\/]//g;
+        $domain         = lc $domain;
+        $counted_domain = $domain;
+        if ($sender) {
+            $sender =~ tr/+%:/@/;
+            $sender =~ s/[^\w\.\-\/\@]//g;
+
+            if ( $sender eq 'mailman' ) {
+                $is_mailman = 1;
+                $domain     = lc Exim::expand_string('$sender_address_domain');
+                $sender_lookup_method .= '/mailman';
+                $sender = 'mailman@' . $domain;
+                $counted_domain = $domain if ( file_exists('/var/cpanel/email_send_limits/count_mailman') );
+            }
+        }
+    }
+    $sender_lookup = $sender;
+    return ( $sender, $domain, $counted_domain, $is_mailman );
+}
+
+sub enforce_mail_permissions {
+    $enforce_mail_permissions_data ? 1 : 0;
+}
+
+sub check_mail_permissions {
+    $check_mail_permissions_domain = undef;
+
+    #Exim::log_write("!DEBUG! running check_mail_permissions");
+
+    my $uid = int( Exim::expand_string('$originator_uid') );
+
+    $enforce_mail_permissions_data     = ':fail: تعداد مجاز ارسال ايميل به پايان رسيده است (: توجه داشته باشيد تعداد مجاز در ارسال ايميل 100 ايميل در ساعت و 1000 ايميل در روز مي باشد ';
+    $check_mail_permissions_result     = '';
+    $check_mail_permissions_data       = ':unknown:';
+    $check_mail_permissions_domain     = '';
+    $check_mail_permissions_sender     = '';
+    $check_mail_permissions_is_mailman = 0;
+    $nobody_uid ||= user2uid('nobody');
+
+    my $acl_c_vhost_owner = ( split( m{:}, Exim::expand_string('$acl_c_vhost_owner') || '' ) )[0];
+    my $acl_c_vhost_owner_known_user = ( $acl_c_vhost_owner && $acl_c_vhost_owner != $nobody_uid ) ? 1 : 0;
+
+    if ( $uid == $nobody_uid && !$acl_c_vhost_owner_known_user && file_exists('/etc/webspam') ) {
+        $enforce_mail_permissions_data = ':fail: Mail sent by user nobody being discarded due to sender restrictions in WHM->Tweak Settings';
+        $check_mail_permissions_result = "uid ($uid) is the nobody_uid ($nobody_uid) and /etc/webspam exists";                                  # for tests (only set when enforce_mail_permissions_data is empty)
+
+        return 'no';
+    }
+
+    my $gid = int( Exim::expand_string('$originator_gid') );
+
+    #MAILTRAP
+    if ( file_exists('/etc/eximmailtrap') ) {
+        $mailtrap_gid ||= int( ( getgrnam('mailtrap') )[2] );
+        $nobody_gid   ||= int( ( getgrnam('nobody') )[2] );
+        if ( $uid >= $nobody_uid && $gid >= $nobody_gid && $gid != $mailtrap_gid ) {
+            $enforce_mail_permissions_data = ":fail: Gid $gid is not permitted to relay mail, or has directly called /usr/sbin/exim instead of /usr/sbin/sendmail.";
+            return 'no';
+        }
+    }
+
+    #MAILTRAP
+
+    if ( Exim::expand_string('$received_protocol') eq 'local' && isdemo($uid) ) {
+        $enforce_mail_permissions_data = ":fail: User with uid $uid is a demo user.  You cannot send mail if your account is in demo mode.";
+        return 'no';
+    }
+
+    my $message_exim_id = Exim::expand_string('$message_exim_id');
+    if ( !$message_exim_id && !Exim::expand_string('$sender_address') ) {
+        $enforce_mail_permissions_data = '';                                                                          # permit normal acction
+                                                                                                                      #Exim::log_write("!DEBUG! check_mail_permissions called without sender_address set from $sender_host_address (rcount: $recipients_count)");
+        $check_mail_permissions_result = "webspam check, mailtrap check, demo check passed and no sender_address";    # for tests (only set when enforce_mail_permissions_data is empty)
+
+        return 'no';
+    }
+
+    # real_domain is the domain of the actual sender
+    # domain is the domain we actually count the message against
+
+    # Currently these are always the same except domain may be
+    # rewritten if we are coming from a mailman list in order
+    # to count against the owner of the list instead of the mailman
+    # user assuming /var/cpanel/email_send_limits/count_mailman exists
+    my ( $sender, $real_domain, $domain, $is_mailman ) = get_message_sender( $uid, $gid, 1 );
+
+    if ( $sender =~ m/^_archive\@/ ) {
+        $enforce_mail_permissions_data = ":fail: Archive Users are not permitted to send email.  Message discarded.";
+        $check_mail_permissions_result = "get_message_sender returned an archive user";
+        return 'no';
+    }
+
+    if ( !$domain || $domain eq '' ) {
+        my $sender_host_address = Exim::expand_string('$received_protocol') eq 'local' ? 'localhost' : Exim::expand_string('$sender_host_address');
+        my $recipients_count    = Exim::expand_string('$recipients_count');
+        my $routed_domain       = Exim::expand_string('$domain');
+        if ( $sender eq 'nobody' && file_exists('/etc/webspam') ) {
+            Exim::log_write("check_mail_permissions could not determine the sender domain for a nobody message [routed_domain=$routed_domain message_exim_id=$message_exim_id sender_host_address=$sender_host_address recipients_count=$recipients_count]") if $recipients_count && !getdomainowner($routed_domain);
+            $enforce_mail_permissions_data = ':fail: Mail sent by user nobody that cannot be linked to a user is being discarded due to sender restrictions in WHM->Tweak Settings';
+            $check_mail_permissions_result = "The sender of the message nobody and /etc/webspam exists";                                                                               # for tests (only set when enforce_mail_permissions_data is empty)
+
+        }
+        else {
+            Exim::log_write("check_mail_permissions could not determine the sender domain [routed_domain=$routed_domain message_exim_id=$message_exim_id sender_host_address=$sender_host_address recipients_count=$recipients_count]") if $recipients_count && !getdomainowner($routed_domain);
+
+            # If delivery is to a userdomain that its expected that we cannot get the sender domain
+            $enforce_mail_permissions_data = '';                                                                                                                                       # permit normal acction
+            $check_mail_permissions_result = "get_message_sender returned no domain";                                                                                                  # for tests (only set when enforce_mail_permissions_data is empty)
+
+        }
+
+        return 'no';
+    }
+    else {
+        if ( !$message_exim_id ) {
+
+            #Exim::log_write("check_mail_permissions !DEBUG! got the domain ($domain) of a message before the message id!");
+        }
+    }
+
+    #Exim::log_write("check_mail_permissions !DEBUG! found sender domain of message: $message_exim_id to be $domain");
+
+    if ( $domain && $domain ne '-system-' ) {
+        my $now;
+
+        if ( file_exists( '/var/cpanel/email_send_limits/max_deferfail_' . $domain ) ) {
+            local $/;
+            my $limit_data;
+            if ( open( my $email_fh, '<', '/var/cpanel/email_send_limits/max_deferfail_' . $domain ) ) {
+                $limit_data = readline($email_fh);
+                close($email_fh);
+            }
+            my ( $currentmail, $maxmails, $percentage ) = $limit_data =~ /([0-9]+)\/([0-9]+)\s+\(([0-9]+)/;
+
+            $currentmail ||= 'unknown';
+            $maxmails    ||= 'unknown';
+            $percentage  ||= 100;
+
+            $enforce_mail_permissions_data = ":fail: Domain $domain has exceeded the max defers and failures per hour ($currentmail/$maxmails ($percentage\%)) allowed. Message discarded.";
+            return 'no';
+        }
+        elsif ( my $maxmails = getmaxemailsperhour($domain) ) {
+            my $currentmail = get_current_emails_per_hour( $domain, ( $now ||= time() ) );
+            if ( $currentmail >= $maxmails ) {
+                my $cutoff_percentage = get_email_send_limits_defer_cutoff();
+                my $percentage = int( ( $currentmail / $maxmails ) * 100 );
+
+                if ( $percentage >= $cutoff_percentage ) {
+                    $enforce_mail_permissions_data = ":fail: Domain $domain has exceeded the max emails per hour ($currentmail/$maxmails ($percentage\%)) allowed.  Message discarded.";
+                    return 'no';
+                }
+                else {
+                    increment_max_emails_per_hour( $domain, ( $now ||= time() ), $message_exim_id );    # need to count it because we will try it later
+                                                                                                        # this will result in percentages above 100% which may be confusing however correct
+                                                                                                        # this is how we decide to defer or fail the message
+                    return _check_mail_permission_defer_with_message("Domain $domain has exceeded the max emails per hour ($currentmail/$maxmails ($percentage\%)) allowed.  $reattempt_message");
+                }
+            }
+        }
+        if ( domain_has_outgoing_mail_suspended($domain) ) {
+            $enforce_mail_permissions_data = ":fail: Domain $domain has outgoing email disabled.";
+            return 'no';
+        }
+        elsif ( domain_has_outgoing_mail_hold($domain) ) {
+            return _check_mail_permission_defer_with_message("Domain $domain has an outgoing mail hold.  $reattempt_message");
+        }
+
+    }
+
+    $check_mail_permissions_msgid  = $message_exim_id if $message_exim_id;
+    $check_mail_permissions_domain = $domain          if $domain;
+    $check_mail_permissions_sender = $sender          if $sender;
+    $check_mail_permissions_is_mailman = $is_mailman;
+    $enforce_mail_permissions_data     = '';                                         # permit normal action
+    $check_mail_permissions_result     = "reached end of check_mail_permissions";    # for tests (only set when enforce_mail_permissions_data is empty)
+
+    return 'no';
+}
+
+sub _check_mail_permission_defer_with_message {
+    my ($message)           = @_;
+    my $message_body        = Exim::expand_string('$message_body');
+    my $message_body_size   = Exim::expand_string('$message_body_size');
+    my $message_body_length = length($message_body);
+
+    $check_mail_permissions_data =
+        qq{# Exim filter\n\nunseen mail }
+      . q{subject "Mail delivery deferred: returning message to sender" }
+      . q{from "Mail Delivery System <Mailer-Daemon@$primary_hostname>" }
+      . q{text "This message was created automatically by mail delivery software.\n} . q{\n}
+      . q{A message that you sent could not be delivered to one or more of its\n}
+      . q{recipients. This is a temporary error. The following address(es) deferred:\n} . q{\n}
+      . q{  $local_part@$domain\n}
+      . qq{    $message} . q{\n\n}
+      . q{------- This is a copy of the message, including all the headers. ------\n}
+      . ( ( $message_body_length < $message_body_size ) ? ( q{------ The body of the message is $message_body_size characters long; only the first\n} . q{------ } . $message_body_length . q{ or so are included here.\n} ) : () )
+      . q{$message_headers\n\n}
+      . q{$message_body"}
+      . qq{\nfinish};
+    $enforce_mail_permissions_data = ":defer: \"$message\"";
+    return 'yes';
+}
+
+sub domain_has_outgoing_mail_hold {
+    my ($domain) = @_;
+    my $user = getdomainowner($domain);
+    if ( $user && user_has_outgoing_mail_hold($user) ) {
+        return 1;
+    }
+    return 0;
+}
+
+sub domain_has_outgoing_mail_suspended {
+    my ($domain) = @_;
+    my $user = getdomainowner($domain);
+    if ( $user && user_has_outgoing_mail_suspended($user) ) {
+        return 1;
+    }
+    return 0;
+}
+
+sub user_has_outgoing_mail_suspended {
+    my ($user) = @_;
+    if ( -e '/etc/outgoing_mail_suspended_users' ) {
+        return user_exists_in_db( $user, '/etc/outgoing_mail_suspended_users' );
+    }
+    return 0;
+}
+
+sub user_has_outgoing_mail_hold {
+    my ($user) = @_;
+    if ( -e '/etc/outgoing_mail_hold_users' ) {
+        return user_exists_in_db( $user, '/etc/outgoing_mail_hold_users' );
+    }
+    return 0;
+}
+
+sub increment_max_emails_per_hour_if_needed {
+
+    # Exim::log_write("!DEBUG! increment_max_emails_per_hour_if_needed entered");
+
+    if ( $check_mail_permissions_domain && $check_mail_permissions_domain ne '-system-' ) {
+        if ( Exim::expand_string('${if first_delivery{1}{0}}') || ( $check_mail_permissions_msgid && _get_last_delivery_message($check_mail_permissions_msgid) =~ m/$reattempt_message/o ) ) {
+
+            # if FIRST_DELIVERY or last line of msglog is our $reattempt_message
+            # example == f@kos.net R=check_mail_permissions defer (-1): Domain pigdog.org has exceeded the max emails per hour (12/10 (120%)) allowed.  Message will be reattempted later
+            # we need to tell the next function to charge us for the message since it was deferred before and we did not get here
+            # Exim::log_write("!DEBUG! increment_max_emails_per_hour=$check_mail_permissions_domain msgid=$check_mail_permissions_msgid");
+            increment_max_emails_per_hour( $check_mail_permissions_domain, time(), $check_mail_permissions_msgid );
+        }
+    }
+
+    return 'no';
+}
+
+sub store_spam {
+    my $sender_host_address = shift;
+    my $spam_score          = shift;
+    my $now                 = time();
+    open( my $spam_fh, '>>', '/var/cpanel/spamstore' );
+
+    #uncomment to deploy
+    #    syswrite($spam_fh, $now . ':' . $sender_host_address . ':' . $spam_score . ":.\n");
+    close($spam_fh);
+}
+
+sub _get_last_delivery_message {
+    my $message_exim_id = shift;
+    my ( $last_message, $msglog_file, $msglog_size );
+    my $spool_directory = Exim::expand_string('$spool_directory');
+    my $spool_split_directory = substr( ( split( /-/, $message_exim_id ) )[0], -1, 1 );
+
+    if ( file_exists("$spool_directory/msglog/$spool_split_directory/$message_exim_id") ) {    #split spool
+        $msglog_size = ( stat(_) )[7];
+        $msglog_file = "$spool_directory/msglog/$spool_split_directory/$message_exim_id";
+    }
+    elsif ( file_exists("$spool_directory/msglog/$message_exim_id") ) {                        #not split
+        $msglog_size = ( stat(_) )[7];
+        $msglog_file = "$spool_directory/msglog/$message_exim_id";
+    }
+    if ( $msglog_file && open( my $msg_log_fh, '<', $msglog_file ) ) {
+        seek( $msg_log_fh, $msglog_size - 4096, 0 ) if $msglog_size > 8192;
+        local $/;
+        $last_message = ( split( /\n/, readline($msg_log_fh) ) )[-1];
+    }
+
+    # Exim::log_write("!DEBUG! _get_last_delivery_message for [$message_exim_id] is $last_message");
+
+    return $last_message || '';
+}
+
+sub resolve_authenticated_sender {
+    my ( $sender, $domain, $sender_lookup_method ) = @_;
+
+    my $sender_address        = Exim::expand_string('$sender_address');
+    my $sender_address_domain = Exim::expand_string('$sender_address_domain');
+
+    # We only want to use the sender in the from header if they have already
+    # authenticated with at least the permissions of the account
+    my ( $from_h_sender, $from_h_localpart, $from_h_domain ) = _get_from_h_sender();
+    $primary_hostname ||= Exim::expand_string('$primary_hostname');
+
+    # The user expects to be able to just set the From: headers
+    # we try to accomodate that first if they have permissions on the account
+    if ( $from_h_domain eq $primary_hostname ) {
+        $sender_lookup_method .= "/primary_hostname/system user";
+    }
+    elsif ( $sender eq getdomainowner($from_h_domain) ) {
+        $sender = $from_h_localpart . '@' . $from_h_domain;
+        $domain = $from_h_domain;
+        $sender_lookup_method .= "/from_h";
+    }
+
+    # otherwise we fallback to the sender_address_domain
+    elsif ( $sender eq getdomainowner($sender_address_domain) ) {
+        $sender = $sender_address;
+        $domain = $sender_address_domain;
+        $sender_lookup_method .= "/sender_address_domain";
+    }
+    else {
+
+        # finally we accept that we don't know who sent it besdies the
+        # authenticated user
+        $sender_lookup_method .= "/only user confirmed/virtual account not confirmed";
+    }
+
+    return ( $sender, $domain, $sender_lookup_method );
+}
+
+sub resolve_vhost_owner {
+
+    if ( file_exists('/var/cpanel/config/email/trust_x_php_script') ) {
+
+        if ( my $x_php_script = Exim::expand_string('$h_X-PHP-Script:') ) {
+
+            #X-PHP-Script: <servername><php-self> for <remote-addr>
+            #X-PHP-Script: www.example.com/~user/testapp/send-mail.php for 10.0.0.1
+            my ( $servername, $uri ) = split( m{/}, $x_php_script, 2 );
+            if ( $uri =~ m/^\/?\~([^\/\s]+)/ ) {
+                my $http_user = $1;
+                my $uid       = user2uid($http_user);
+
+                Exim::log_write("nobody send identification H=localhost A=127.0.0.1 U=$http_user ID=$uid B=acl_c_vhost_owner M=trust_x_php_script");
+                return $uid . ':' . '//' . $servername . '/' . $uri . ' ';
+            }
+            elsif ( my $http_user = getdomainowner($servername) ) {
+                my $uid = user2uid($http_user);
+
+                Exim::log_write("nobody send identification H=localhost A=127.0.0.1 U=$http_user ID=$uid B=acl_c_vhost_owner M=trust_x_php_script");
+                return $uid . ':' . '//' . $servername . '/' . $uri . ' ';
+            }
+        }
+    }
+
+    if ( file_exists('/var/cpanel/config/email/query_apache_for_nobody_senders') ) {
+
+        # Lets lookup the real uid by querying apache
+        require Cpanel::ProcessInfo;
+        require Cpanel::ApacheServerStatus;
+        my $server_status = Cpanel::ApacheServerStatus->new();
+
+        my $httpd_pid;
+        my $http_status_data;
+        my $current_pid = $$;
+        while ( ( $current_pid = Cpanel::ProcessInfo::get_parent_pid($current_pid) ) && $current_pid != 1 ) {
+            if ( my $status_data = $server_status->get_status_by_pid($current_pid) ) {
+                $httpd_pid        = $current_pid;
+                $http_status_data = $status_data;
+                last;
+            }
+        }
+
+        if ($http_status_data) {
+            my $uri = ( split( /\s+/, $http_status_data->{'request'} ) )[1];
+            if ( $uri =~ m/^\/?\~([^\/\s]+)/ ) {
+                my $http_user = $1;
+                my $uid       = user2uid($http_user);
+
+                Exim::log_write("nobody send identification H=localhost A=127.0.0.1 U=$http_user ID=$uid B=acl_c_vhost_owner M=query_apache_for_nobody_senders");
+                return $uid . ':' . '//' . $http_status_data->{'vhost'} . $uri . ' ';
+            }
+            elsif ( my $http_user = getdomainowner( $http_status_data->{'vhost'} ) ) {
+                my $uid = user2uid($http_user);
+
+                Exim::log_write("nobody send identification H=localhost A=127.0.0.1 U=$http_user ID=$uid B=acl_c_vhost_owner M=query_apache_for_nobody_senders");
+                return $uid . ':' . '//' . $http_status_data->{'vhost'} . $uri . ' ';
+            }
+        }
+
+    }
+
+    return;
+}
+
+# Obtain the from header from the message
+# We fallback to the envelope sender if there
+# is no from header set (ie sendmail -bt or missing From header)
+sub _get_from_h_sender {
+    my $from_h_domain     = Exim::expand_string('${domain:$h_From:}');
+    my $from_h_local_part = Exim::expand_string('${local_part:$h_From:}');
+
+    if ( length $from_h_local_part ) {
+        if ( length $from_h_domain ) {
+            return ( $from_h_local_part . '@' . $from_h_domain, $from_h_local_part, $from_h_domain );
+        }
+        else {
+            $primary_hostname ||= Exim::expand_string('$primary_hostname');
+            return ( $from_h_local_part . '@' . $primary_hostname, $from_h_local_part, $primary_hostname );
+        }
+    }
+    else {
+        # Handle fallback to sender_address when message is missing a from header
+        my $sender_address_domain     = Exim::expand_string('$sender_address_domain');
+        my $sender_address_local_part = Exim::expand_string('$sender_address_local_part');
+        return ( $sender_address_local_part . '@' . $sender_address_domain, $sender_address_local_part, $sender_address_domain );
+    }
+}
+# Obselete as we no longer need the quota test since the spamassassin bug has been solved
+# (dbm fix)
+
+sub acl_checksa_deliver {
+    if (-e '/etc/global_spamassassin_enable') { return 1; }
+
+    my $domain = shift;
+    my $owner = getdomainowner($domain);
+    my $homedir = shift;
+    if (!$homedir) {
+         $homedir = gethomedir($owner);
+    }
+    return ( (-e $homedir . '/.spamassassinenable' ) ? 1 : 0 );
+}
+
+sub acl_checkusersa {
+    if (-e '/etc/global_spamassassin_enable') { return 1; }
+
+    my $owner = shift;
+    if ($owner eq 'root') { return 0; }
+    my $homedir = shift;
+    if (!$homedir) {
+         $homedir = gethomedir($owner);
+    }
+
+    return ( (-e $homedir . '/.spamassassinenable' ) ? 1 : 0 );
+}
+
+sub quotatest {
+    my $owner = shift;
+    my $homedir = shift;
+
+    if ($> == 0) {
+        my $waittime = 1;
+        while(-e ${homedir} . '/.spamassassinquotatest') {
+            if ($waittime == 60) { last; }
+            $waittime++;
+            sleep(1);
+        }
+        my $pid;
+        if (!($pid = fork())) {
+            umask(0002);
+            &setuids($owner);
+            open(QUOTATEST,">${homedir}/.spamassassinquotatest");
+            print QUOTATEST " " x 4096;
+            close(QUOTATEST);
+            exit();
+        }
+        waitpid($pid,0);
+        if (!((stat("${homedir}/.spamassassinquotatest"))[7] == 4096)) {
+            unlink("${homedir}/.spamassassinquotatest");
+            return 0;
+        }
+        unlink("${homedir}/.spamassassinquotatest");
+    }
+    return 1;
+}
+require Cpanel::Encoder::Exim;
+
+1;
+BEGIN { # Suppress load of all of these at earliest point.
+    $INC{'Cpanel/Encoder/Exim.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Pack.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Validate/IP.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Validate/IP/Expand.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/IP/Expand.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Linux/Netlink.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Linux/Proc/Net/Tcp.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Ident.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/ProcessInfo.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Fcntl/Constants.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Socket/Constants.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/Hulk/Constants.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+    $INC{'Cpanel/ApacheServerStatus.pm'} = '/usr/local/cpanel/tmp/exim.local.build.pl.static';
+}
+
+{ # --- BEGIN Cpanel/Encoder/Exim.pm
+package Cpanel::Encoder::Exim;
+
+
+
+my %encodes = (
+    q{\\}  => q{\\\\\\\\},    #\ -> \\\\
+    q{"}   => q{\\"},         #" -> \"
+    q{$}   => q{\\\\$},       #$ -> \\$
+    "\x0a" => q{\\n},         #newline -> \n
+    "\x0d" => q{\\r},         #carriage return -> \r
+    "\x09" => q{\\t},         #tab => \t
+);
+
+sub encode_string_literal {
+    return if !defined $_[0];
+
+    return q{"} . join( q{}, map { $encodes{$_} || $_ } split( m{}, $_[0] ) ) . q{"};
+}
+
+sub unquoted_encode_string_literal {
+    my $string = shift;
+    return if !defined $string;
+
+    $string =~ s/\\N/\\N\\\\N\\N/g;    # Only use / here for perl compat
+    return "\\N$string\\N";
+}
+
+1;
+
+} # --- END Cpanel/Encoder/Exim.pm
+
+
+{ # --- BEGIN Cpanel/Pack.pm
+package Cpanel::Pack;
+
+
+
+use strict;
+
+sub new {
+    my ( $class, $template_ar ) = @_;
+
+    if ( @$template_ar % 2 ) {
+        die "Cpanel::Pack::new detected an odd number of elements in hash assignment!";
+    }
+
+    my $self = bless {
+        'template_str' => '',
+        'keys'         => [],
+    }, $class;
+
+    my $ti = 0;
+    while ( $ti < $#$template_ar ) {
+        push @{ $self->{'keys'} }, $template_ar->[$ti];
+        $self->{'template_str'} .= $template_ar->[ 1 + $ti ];
+        $ti += 2;
+    }
+
+    return $self;
+}
+
+sub unpack_to_hashref {    ## no critic (RequireArgUnpacking)
+    my %result;
+    @result{ @{ $_[0]->{'keys'} } } = unpack( $_[0]->{'template_str'}, $_[1] );
+    return \%result;
+}
+
+sub pack_from_hashref {
+    my ( $self, $opts_ref ) = @_;
+    no warnings 'uninitialized';
+    return pack( $self->{'template_str'}, @{$opts_ref}{ @{ $self->{'keys'} } } );
+}
+
+sub sizeof {
+    my ($self) = @_;
+    return ( $self->{'sizeof'} ||= length pack( $self->{'template_str'}, () ) );
+}
+
+1;
+
+} # --- END Cpanel/Pack.pm
+
+
+{ # --- BEGIN Cpanel/Validate/IP.pm
+package Cpanel::Validate::IP;
+
+
+use strict;
+
+sub is_valid_ipv4 {    ##no critic qw(RequireArgUnpacking)
+    return unless $_[0];    # False scalars are never an _[0].
+    my @segments = split /\./, $_[0], -1;
+    return if               #
+      scalar @segments != 4 ||    #
+      ( !length $segments[3] || $segments[3] =~ tr/0-9//c || $segments[3] > 255 ) ||    #
+      ( !length $segments[2] || $segments[2] =~ tr/0-9//c || $segments[2] > 255 ) ||    #
+      ( !length $segments[1] || $segments[1] =~ tr/0-9//c || $segments[1] > 255 ) ||    #
+      ( !length $segments[0] || !$segments[0] || $segments[0] =~ tr/0-9//c || $segments[0] > 255 );
+    return 1;
+}
+
+sub is_valid_cidr4 {
+    my ($ip) = @_;
+
+    return unless defined $ip && $ip;
+    my ( $ip4, $mask ) = split /\//, $ip;
+    return if !defined $mask || !length $mask || $mask =~ m/[^0-9]/;
+
+    return is_valid_ipv4($ip4) && 0 < $mask && $mask <= 32;
+}
+
+sub is_valid_ipv6 {
+    my ($ip) = @_;
+    return unless defined $ip && $ip;
+    return if $ip =~ /^:[^:]/ || $ip =~ /[^:]:$/;    # Can't have single : on front or back
+
+    my @seg = split /:/, $ip, -1;                    # -1 to keep trailing empty fields
+
+    shift @seg if $seg[0] eq '';
+    pop @seg   if $seg[-1] eq '';
+
+    my $max = 8;
+    if ( $seg[-1] =~ tr/.// ) {
+        return unless is_valid_ipv4( pop @seg );
+        $max -= 2;
+    }
+
+    my $cmp;
+    for my $seg (@seg) {
+        if ( !defined $seg || $seg eq '' ) {
+
+            return if $cmp;
+            ++$cmp;
+            next;
+        }
+        return if $seg =~ tr/0-9a-fA-F//c || length $seg == 0 || length $seg > 4;
+    }
+    if ($cmp) {
+
+        return ( @seg && @seg <= $max ) && 1;    # true returned as 1
+    }
+
+    return $max == @seg;
+}
+
+sub is_valid_ipv6_prefix {
+    my ($ip) = @_;
+    return unless $ip;
+    my ( $ip6, $mask ) = split /\//, $ip;
+    return unless defined $mask;
+    return if !length $mask || $mask =~ tr/0-9//c;
+    return is_valid_ipv6($ip6) && 0 < $mask && $mask <= 128;
+}
+
+sub is_valid_ip {
+    return unless defined $_[0];
+    return $_[0] =~ tr/:// ? is_valid_ipv6(@_) : is_valid_ipv4(@_);
+}
+
+sub ip_version {
+    return 4 if is_valid_ipv4(@_);
+    return 6 if is_valid_ipv6(@_);
+    return;
+}
+
+sub is_valid_ip_cidr_or_prefix {
+    return unless defined $_[0];
+    if ( $_[0] =~ tr/:// ) {
+        return $_[0] =~ tr{/}{} ? is_valid_ipv6_prefix(@_) : is_valid_ipv6(@_);
+    }
+    return $_[0] =~ tr{/}{} ? is_valid_cidr4(@_) : is_valid_ipv4(@_);
+}
+
+sub is_valid_ip_range_cidr_or_prefix {
+    my $str = shift;
+    return 1 if Cpanel::Validate::IP::is_valid_ip_cidr_or_prefix($str);
+
+    my @pieces = split /-/, $str, 2;
+    return 1 if 2 == map { Cpanel::Validate::IP::is_valid_ipv4($_) } @pieces;
+    return 1 if 2 == map { Cpanel::Validate::IP::is_valid_ipv6($_) } @pieces;
+    return 0;
+}
+
+1;
+
+} # --- END Cpanel/Validate/IP.pm
+
+
+{ # --- BEGIN Cpanel/Validate/IP/Expand.pm
+package Cpanel::Validate::IP::Expand;
+
+
+use strict;
+
+# use Cpanel::Validate::IP ();
+
+sub normalize_ipv4 {
+    my $ip = shift;
+
+    return unless Cpanel::Validate::IP::is_valid_ipv4($ip);
+    return join '.', map { $_ + 1 - 1 } split /\./, $ip;
+}
+
+sub expand_ipv6 {
+    my $ip = shift;
+
+    return unless Cpanel::Validate::IP::is_valid_ipv6($ip);
+
+    my @seg = split /:/, $ip, -1;
+
+    $seg[0]  = '0000' if !length $seg[0];
+    $seg[-1] = '0000' if !length $seg[-1];
+
+    my $ipv4;
+    my $embedded_v4 = 0;
+    if ( $seg[-1] =~ tr{.}{} && Cpanel::Validate::IP::is_valid_ipv4( $seg[-1] ) ) {
+        my @ipv4 = split /\./, normalize_ipv4( pop @seg );
+        push @seg, sprintf( '%04x', ( $ipv4[0] << 8 ) + $ipv4[1] );
+        push @seg, sprintf( '%04x', ( $ipv4[2] << 8 ) + $ipv4[3] );
+    }
+    my @exp;
+    for my $seg (@seg) {
+        if ( !length $seg ) {
+            my $count = scalar(@seg) - scalar(@exp);
+            while ( $count + scalar(@exp) + $embedded_v4 <= 8 ) {
+                push @exp, '0000';
+            }
+        }
+        else {
+            push @exp, sprintf( '%04x', hex $seg );
+        }
+    }
+    push @exp, $ipv4 if $embedded_v4;
+    return join ':', @exp;
+}
+
+sub normalize_ipv6 {
+    my $ip = shift;
+
+    return unless $ip = expand_ipv6($ip);
+
+    $ip = lc($ip);
+
+    $ip =~ s/:(0+:){2,}/::/;         # flatten multiple groups of 0's to :: #
+    $ip =~ s/^0+([1-9a-f])/$1/;      # flatten the first segment's leading 0's to a single 0 #
+    $ip =~ s/:0+([1-9a-f])/:$1/g;    # flatten each segment, after the first, leading 0's to a single 0 #
+    $ip =~ s/:0+(:)/:0$1/g;          # flatten any segments that are just 0's to a single 0 #
+    $ip =~ s/:0+$/:0/g;              # flatten the end segment if it's just 0's to a single 0 #
+    $ip =~ s/^0+::/::/;              # remove single 0 at the beginning #
+    $ip =~ s/::0+$/::/;              # remote single 0 at the end #
+
+    return $ip;
+
+}
+
+sub normalize_ip {
+    my $ip = shift;
+    return unless defined $ip;
+    return $ip =~ tr/:// ? normalize_ipv6($ip) : normalize_ipv4($ip);
+}
+
+sub expand_ip {
+    my $ip = shift;
+    return unless defined $ip;
+    return $ip =~ tr/:// ? expand_ipv6($ip) : normalize_ipv4($ip);
+}
+
+1;
+
+} # --- END Cpanel/Validate/IP/Expand.pm
+
+
+{ # --- BEGIN Cpanel/IP/Expand.pm
+package Cpanel::IP::Expand;
+
+
+use strict;
+# use Cpanel::Validate::IP         ();
+# use Cpanel::Validate::IP::Expand ();
+
+sub expand_ip {
+    my ( $ip, $version ) = @_;
+
+    $ip =~ s/\s//g if defined $ip;
+
+    if ( defined $version && $version eq 6 && Cpanel::Validate::IP::is_valid_ipv4($ip) ) {
+        $ip = "::ffff:$ip";
+    }
+    elsif ( !Cpanel::Validate::IP::is_valid_ip($ip) ) {
+
+        if ( defined $version && $version eq 6 || $ip =~ m/:/ ) {
+            return '0000:0000:0000:0000:0000:0000:0000:0000';
+        }
+        else {
+            return '0.0.0.0';
+        }
+    }
+    return Cpanel::Validate::IP::Expand::expand_ip($ip);
+}
+1;
+
+} # --- END Cpanel/IP/Expand.pm
+
+
+{ # --- BEGIN Cpanel/Linux/Netlink.pm
+package Cpanel::Linux::Netlink;
+
+
+
+use strict;
+
+use constant DEBUG => 0;
+
+# use Cpanel::Pack ();
+
+my $NETLINK_READ_SIZE = 262144;    # Maximum size of netlink message
+
+our $PF_NETLINK = 16;
+our $AF_INET    = 2;
+our $AF_INET6   = 10;
+
+our $NLMSG_ERROR = 0x2;
+our $NLMSG_DONE  = 0x3;
+
+our $NETLINK_INET_DIAG  = 4;
+our $NLM_F_REQUEST      = 1;
+our $NLM_F_MULTI        = 2;            # /* Multipart message, terminated by NLMSG_DONE */
+our $NLM_F_ROOT         = 0x100;
+our $NLM_F_MATCH        = 0x200;
+our $SOCK_DGRAM         = 2;
+our $TCPDIAG_GETSOCK    = 18;
+our $INET_DIAG_NOCOOKIE = 0xFFFFFFFF;
+
+our $PACK_TEMPLATE_U32  = 'L';
+our $U32_BYTES_LENGTH   = 4;
+our $PACK_TEMPLATE_U16  = 'S';
+our $U16_BYTES_LENGTH   = 2;
+our $PACK_TEMPLATE_U8   = 'C';
+our $U8_BYTES_LENGTH    = 1;
+our $PACK_TEMPLATE_BE16 = 'n';
+our $PACK_TEMPLATE_BE32 = 'N';
+
+my $NLMSG_HEADER_PACK_OBJ;
+my $NLMSG_HEADER_PACK_OBJ_SIZE;
+my @NLMSG_HEADER_TEMPLATE = (
+    'nlmsg_length' => $PACK_TEMPLATE_U32,    #__u32 nlmsg_len;    /* Length of message including header. */
+    'nlmsg_type'   => $PACK_TEMPLATE_U16,    #__u16 nlmsg_type;   /* Type of message content. */
+    'nlmsg_flags'  => $PACK_TEMPLATE_U16,    #__u16 nlmsg_flags;  /* Additional flags. */
+    'nlmsg_seq'    => $PACK_TEMPLATE_U32,    #__u32 nlmsg_seq;    /* Sequence number. */
+    'nlmsg_pid'    => $PACK_TEMPLATE_U32,    #__u32 nlmsg_pid;    /* Sender port ID. */
+);
+
+
+my @NETLINK_XACTION_REQUIRED = (
+    'message',          #hashref, to be sent via “send_pack_obj”
+    'send_pack_obj',    #Cpanel::Pack instance
+    'recv_pack_obj',    #Cpanel::Pack instance
+    'sock',             #Perl socket
+);
+
+sub netlink_transaction {
+    my (%OPTS) = @_;
+
+    foreach (@NETLINK_XACTION_REQUIRED) {
+
+        die "$_ is required for netlink_transaction" if !$OPTS{$_};
+    }
+    my ( $message_ref, $send_pack_obj, $recv_pack_obj, $sock, $parser, $payload_parser, $header_parms_ar ) = @OPTS{ @NETLINK_XACTION_REQUIRED, 'parser', 'payload_parser', 'header' };
+
+    my $packed_nlmsg = _pack_nlmsg_with_header( $send_pack_obj, $message_ref, $header_parms_ar );
+
+    if (DEBUG) {
+        eval 'require Data::Dumper;';
+        print STDERR "[request]:" . 'Data::Dumper'->can('Dumper')->($message_ref);
+    }
+
+    printf STDERR "Send %v02x\n", $packed_nlmsg if DEBUG;
+
+    send( $sock, $packed_nlmsg, 0 ) or die "send: $!";
+
+    my ( $header_hr, $message_hr );
+    my $packed_response = '';
+
+    my $header_pack_size = $NLMSG_HEADER_PACK_OBJ->sizeof();
+    my $recv_pack_size   = $recv_pack_obj->sizeof();
+
+    my $msgcount = 0;
+  READ_LOOP:
+    while ( !_nlmsg_type_indicates_finished_reading($message_hr) ) {
+        sysread( $sock, $packed_response, $NETLINK_READ_SIZE, length $packed_response ) or die "sysread: $!";
+
+      PARSE_LOOP:
+        while (1) {
+
+            $header_hr = $NLMSG_HEADER_PACK_OBJ->unpack_to_hashref( substr( $packed_response, 0, $header_pack_size, q<> ) );
+
+            my $nlmsg_length = $header_hr->{'nlmsg_length'};
+
+            print STDERR "Received message with size: [$nlmsg_length]\n" if DEBUG;
+
+            last PARSE_LOOP if !$nlmsg_length || length $packed_response < $nlmsg_length - $NLMSG_HEADER_PACK_OBJ_SIZE;
+
+            if ( $header_hr->{'nlmsg_type'} == $NLMSG_ERROR ) {
+                eval 'require Data::Dumper;';
+                WARN( "Error while reading netlink: " . 'Data::Dumper'->can('Dumper')->($header_hr) );
+                last READ_LOOP;
+            }
+
+            my $main_msg = substr( $packed_response, 0, $recv_pack_size, '' );
+
+            $message_hr = $recv_pack_obj->unpack_to_hashref($main_msg);
+
+            if (DEBUG) {
+                eval 'require Data::Dumper;';
+                printf STDERR "Received %v02x\n", $main_msg;
+                print STDERR "[response]:" . 'Data::Dumper'->can('Dumper')->( $header_hr, $message_hr );
+            }
+
+            my $payload = substr(
+                $packed_response,
+                0,
+                $nlmsg_length - $NLMSG_HEADER_PACK_OBJ_SIZE - $recv_pack_size,
+                q<>,
+            );
+
+            if ( $payload_parser && length $payload ) {
+                printf STDERR "payload: Received %v02x\n", $payload if DEBUG;
+
+                $payload_parser->( $msgcount, $message_hr, $payload );
+            }
+
+            last READ_LOOP if _nlmsg_type_indicates_finished_reading($header_hr);
+
+            $msgcount++;
+        }
+
+    }
+
+    $parser->( $msgcount, $message_hr ) if $parser && $header_hr->{'nlmsg_type'};
+
+    return 1;
+}
+
+sub WARN {
+    my (@msg) = @_;
+    return warn(@msg);
+}
+
+
+my @INET_DIAG_SOCKID_TEMPLATE = (
+    'idiag_sport'    => $PACK_TEMPLATE_BE16,    #__be16  idiag_sport;
+    'idiag_dport'    => $PACK_TEMPLATE_BE16,    #__be16  idiag_dport;
+    'idiag_src_0'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_src[0];
+    'idiag_src_1'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_src[1];
+    'idiag_src_2'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_src[2];
+    'idiag_src_3'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_src[3];
+    'idiag_dst_0'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_dst[0];
+    'idiag_dst_1'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_dst[1];
+    'idiag_dst_2'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_dst[2];
+    'idiag_dst_3'    => $PACK_TEMPLATE_BE32,    #__be32  idiag_dst[3];
+    'idiag_if'       => $PACK_TEMPLATE_U32,     #__u32  idiag_if;
+    'idiag_cookie_0' => $PACK_TEMPLATE_U32,     #__u32  idiag_cookie[0];
+    'idiag_cookie_1' => $PACK_TEMPLATE_U32,     #__u32  idiag_cookie[1];
+);
+
+my $INET_DIAG_MSG_PACK_OBJ;
+my @INET_DIAG_MSG_TEMPLATE = (
+    'idiag_family'  => $PACK_TEMPLATE_U8,       # __u8    idiag_family;           /* Family of addresses. */
+    'idiag_state'   => $PACK_TEMPLATE_U8,       # __u8    idiag_state;
+    'idiag_timer'   => $PACK_TEMPLATE_U8,       # __u8    idiag_timer;
+    'idiag_retrans' => $PACK_TEMPLATE_U8,       # __u8    idiag_retrans;
+    @INET_DIAG_SOCKID_TEMPLATE,                 # inet_diag_sockid
+    'idiag_expires' => $PACK_TEMPLATE_U32,      #__u32   idiag_expires;
+    'idiag_rqueue'  => $PACK_TEMPLATE_U32,      #__u32   idiag_rqueue;
+    'idiag_wqueue'  => $PACK_TEMPLATE_U32,      #__u32   idiag_wqueue;
+    'idiag_uid'     => $PACK_TEMPLATE_U32,      #__u32   idiag_uid;
+    'idiag_inode'   => $PACK_TEMPLATE_U32       #__u32   idiag_inode;
+);
+
+my $INET_DIAG_REQ_PACK_OBJ;
+my @INET_DIAG_REQ_TEMPLATE = (
+    'idiag_family'  => $PACK_TEMPLATE_U8,       # __u8    idiag_family;           /* Family of addresses. */
+    'idiag_src_len' => $PACK_TEMPLATE_U8,       # __u8    idiag_src_len;
+    'idiag_dst_len' => $PACK_TEMPLATE_U8,       # __u8    idiag_dst_len;
+    'idiag_ext'     => $PACK_TEMPLATE_U8,       # __u8    idiag_ext;              /* Query extended information */
+    @INET_DIAG_SOCKID_TEMPLATE,                 #inet_diag_sockid
+    'idiag_states' => $PACK_TEMPLATE_U32,       #__u32   idiag_states;           /* States to dump */
+    'idiag_dbs'    => $PACK_TEMPLATE_U32        #__u32   idiag_dbs;           /* Tables to dump (NI) */
+);
+
+sub connection_lookup {
+    my ( $source_address, $source_port, $dest_address, $dest_port ) = @_;
+
+    die "A source port is required."      if !defined $source_port;
+    die "A destination port is required." if !defined $dest_port;
+
+    my ( $idiag_dst_0, $idiag_dst_1, $idiag_dst_2, $idiag_dst_3 );
+    my ( $idiag_src_0, $idiag_src_1, $idiag_src_2, $idiag_src_3 );
+    my ($idiag_family);
+
+    if ( $dest_address =~ tr/:// ) {
+        require Cpanel::IP::Expand;    # hide from exim but not perlcc - not eval quoted
+
+        ( $idiag_dst_0, $idiag_dst_1, $idiag_dst_2, $idiag_dst_3 ) = unpack( 'N4', pack( 'n8', split /:/, Cpanel::IP::Expand::expand_ip($dest_address) ) );
+        ( $idiag_src_0, $idiag_src_1, $idiag_src_2, $idiag_src_3 ) = unpack( 'N4', pack( 'n8', split /:/, Cpanel::IP::Expand::expand_ip($source_address) ) );
+        $idiag_family = $AF_INET6;
+    }
+    else {
+        my $u32_dest_address   = unpack( 'N', pack( 'C4', split( /\D/, $dest_address,   4 ) ) );
+        my $u32_source_address = unpack( 'N', pack( 'C4', split( /\D/, $source_address, 4 ) ) );
+        $idiag_src_0  = $u32_source_address;
+        $idiag_dst_0  = $u32_dest_address;
+        $idiag_family = $AF_INET;
+    }
+
+    my $sock;
+    socket( $sock, $PF_NETLINK, $SOCK_DGRAM, $NETLINK_INET_DIAG ) or die "socket: $!";
+
+    $INET_DIAG_REQ_PACK_OBJ ||= Cpanel::Pack->new( \@INET_DIAG_REQ_TEMPLATE );
+    $INET_DIAG_MSG_PACK_OBJ ||= Cpanel::Pack->new( \@INET_DIAG_MSG_TEMPLATE );
+
+    my %RESPONSE;
+    netlink_transaction(
+        'message' => {
+            'idiag_family'   => $idiag_family,
+            'idiag_dst_0'    => $idiag_dst_0,
+            'idiag_dst_1'    => $idiag_dst_1,
+            'idiag_dst_2'    => $idiag_dst_2,
+            'idiag_dst_3'    => $idiag_dst_3,
+            'idiag_dport'    => $dest_port,
+            'idiag_src_0'    => $idiag_src_0,
+            'idiag_src_1'    => $idiag_src_1,
+            'idiag_src_2'    => $idiag_src_2,
+            'idiag_src_3'    => $idiag_src_3,
+            'idiag_sport'    => $source_port,
+            'idiag_cookie_0' => $INET_DIAG_NOCOOKIE,
+            'idiag_cookie_1' => $INET_DIAG_NOCOOKIE,
+        },
+        'sock'          => $sock,
+        'send_pack_obj' => $INET_DIAG_REQ_PACK_OBJ,
+        'recv_pack_obj' => $INET_DIAG_MSG_PACK_OBJ,
+        'parser'        => sub {
+            my ( undef, $response_ref ) = @_;
+            %RESPONSE = %$response_ref if ( $response_ref && 'HASH' eq ref $response_ref );
+        }
+    );
+
+    return \%RESPONSE;
+}
+
+
+my @NETLINK_SEND_HEADER = (
+    'nlmsg_length' => undef,              #gets put in place
+    'nlmsg_type'   => $TCPDIAG_GETSOCK,
+    'nlmsg_flags'  => 0,                  #gets |=’d with $NLM_F_REQUEST
+    'nlmsg_pid'    => undef,              #gets put in place
+    'nlmsg_seq'    => 2,                  #default
+);
+
+sub _pack_nlmsg_with_header {
+    my ( $send_pack_obj, $message_ref, $header_parms_ar ) = @_;
+
+    my $nlmsg = $send_pack_obj->pack_from_hashref($message_ref);
+
+    if ( !$NLMSG_HEADER_PACK_OBJ ) {
+        $NLMSG_HEADER_PACK_OBJ      = Cpanel::Pack->new( \@NLMSG_HEADER_TEMPLATE );
+        $NLMSG_HEADER_PACK_OBJ_SIZE = $NLMSG_HEADER_PACK_OBJ->sizeof();
+    }
+
+    my %header_data = (
+        @NETLINK_SEND_HEADER,
+        ( $header_parms_ar ? @$header_parms_ar : () ),
+        nlmsg_length => $NLMSG_HEADER_PACK_OBJ_SIZE + length $nlmsg,
+        nlmsg_pid    => $$,
+    );
+
+    $header_data{'nlmsg_flags'} |= $NLM_F_REQUEST;
+
+    my $hdr_str = $NLMSG_HEADER_PACK_OBJ->pack_from_hashref( \%header_data );
+
+    return $hdr_str . $nlmsg;
+}
+
+sub _nlmsg_type_indicates_finished_reading {
+    my ($header_hr) = @_;
+
+    return 0 if !length $header_hr->{'nlmsg_type'};
+    return 1 if $header_hr->{'nlmsg_type'} == $NLMSG_ERROR;
+
+    return 1 if ( $header_hr->{'nlmsg_flags'} & $NLM_F_MULTI && $header_hr->{'nlmsg_type'} == $NLMSG_DONE );
+    return 1 if !( $header_hr->{'nlmsg_flags'} & $NLM_F_MULTI );
+    return 0;
+}
+
+1;
+
+} # --- END Cpanel/Linux/Netlink.pm
+
+
+{ # --- BEGIN Cpanel/Linux/Proc/Net/Tcp.pm
+package Cpanel::Linux::Proc::Net::Tcp;
+
+
+use strict;
+
+our $PROC_NET_TCP  = '/proc/net/tcp';
+our $PROC_NET_TCP6 = '/proc/net/tcp6';
+
+sub connection_lookup {
+    my ( $remote_address, $remote_port, $local_address, $local_port ) = @_;
+
+    my ( $tcp_file, $remote_ltl_endian_hex_address, $remote_hex_port, $local_ltl_endian_hex_address, $local_hex_port );
+
+    $remote_hex_port = _dec_port_to_hex_port($remote_port);
+    $local_hex_port  = _dec_port_to_hex_port($local_port);
+
+    if ( $remote_address =~ tr/:// ) {    #ipv6
+        $tcp_file                      = $PROC_NET_TCP6;
+        $remote_ltl_endian_hex_address = _ipv6_text_to_little_endian_hex_address($remote_address);
+        $local_ltl_endian_hex_address  = _ipv6_text_to_little_endian_hex_address($local_address);
+    }
+    else {
+        $tcp_file                      = $PROC_NET_TCP;
+        $remote_ltl_endian_hex_address = _ipv4_txt_to_little_endian_hex_address($remote_address);
+        $local_ltl_endian_hex_address  = _ipv4_txt_to_little_endian_hex_address($local_address);
+    }
+
+    if ( open( my $tcp_fh, '<', $tcp_file ) ) {
+        my $uid;
+        while ( readline($tcp_fh) ) {
+            if (   m/^\s+\d+:\s+([\dA-F]{8}(?:[\dA-F]{24})?):([\dA-F]{4})\s+([\dA-F]{8}(?:[\dA-F]{24})?):([\dA-F]{4})\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)/
+                && $remote_ltl_endian_hex_address eq $1
+                && $remote_hex_port eq $2
+                && $local_ltl_endian_hex_address eq $3
+                && $local_hex_port eq $4 ) {
+
+                $uid = $6;
+                last;
+            }
+
+        }
+        return $uid;
+
+    }
+
+    return;
+}
+
+sub _dec_port_to_hex_port {
+    my ($dec_port) = @_;
+
+    return sprintf( '%04X', $dec_port );
+}
+
+sub _ipv4_txt_to_little_endian_hex_address {
+    my ($ipv4_txt) = @_;
+
+    return sprintf( "%08X", unpack( 'V', pack( 'C4', split( /\D/, $ipv4_txt, 4 ) ) ) );
+}
+
+sub _ipv6_text_to_little_endian_hex_address {
+    my ($ipv6_txt) = @_;
+
+    require Cpanel::IP::Expand;    # hide from exim but not perlcc - not eval quoted
+
+    my $hexip = '';
+    my @ip = split /:/, Cpanel::IP::Expand::expand_ip( $ipv6_txt, 6 );
+    while (@ip) {
+        my $block1 = shift @ip;
+        my $block2 = shift @ip;
+        $hexip .= uc substr( $block2, 2, 2 ) . uc substr( $block2, 0, 2 ) . uc substr( $block1, 2, 2 ) . uc substr( $block1, 0, 2 );
+    }
+    return $hexip;
+}
+
+1;
+
+} # --- END Cpanel/Linux/Proc/Net/Tcp.pm
+
+
+{ # --- BEGIN Cpanel/Ident.pm
+package Cpanel::Ident;
+
+
+use strict;
+
+our $TESTING_FLAGS = 0;    # FOR TESTING
+our $USE_NETLINK   = 1;    # FOR TESTING
+our $USE_PROC      = 2;    # FOR TESTING
+
+use constant NOTFOUND => 0xff_ff_ff_ff;
+
+sub identify_local_connection {
+    my ( $source_address, $source_port, $dest_address, $dest_port ) = @_;
+
+    if ( !defined($source_port) || !defined($dest_port) ) {
+        die 'Need source and destination ports!';
+    }
+
+    my $netlink_failed;
+
+    if ( !$TESTING_FLAGS || $TESTING_FLAGS == $USE_NETLINK ) {
+        require Cpanel::Linux::Netlink;    # hide from exim but not perlcc - not eval quoted
+        my $response;
+
+        local $@;
+
+        eval {
+            $response = Cpanel::Linux::Netlink::connection_lookup(
+                $source_address, $source_port,
+                $dest_address,   $dest_port,
+            );
+        };
+
+        if ($@) {
+            $netlink_failed = 1;
+
+            warn;
+        }
+
+        elsif ($response
+            && ref $response
+            && $response->{'idiag_dport'}
+            && defined( $response->{'idiag_uid'} )
+            && $response->{'idiag_uid'} != NOTFOUND() ) {
+            return $response->{'idiag_uid'};
+        }
+    }
+
+    if ( $netlink_failed || $TESTING_FLAGS == $USE_PROC ) {
+        require Cpanel::Linux::Proc::Net::Tcp;    # hide from exim but not perlcc - not eval quoted
+        my $uid = Cpanel::Linux::Proc::Net::Tcp::connection_lookup( $source_address, $source_port, $dest_address, $dest_port );
+        return $uid if defined $uid;
+    }
+
+    return;
+}
+
+1;
+
+} # --- END Cpanel/Ident.pm
+
+
+{ # --- BEGIN Cpanel/ProcessInfo.pm
+package Cpanel::ProcessInfo;
+
+
+our $VERSION = '0.3';
+
+sub get_parent_pid {
+    my ($pid) = $_[0] =~ /([0-9]+)/;
+    return getppid() if $pid == $$;
+
+    if ( open( my $proc_status_fh, '<', "/proc/$pid/status" ) ) {
+        local $/;
+        my %status = map { lc $_->[0] => $_->[1] }
+          map { [ ( split( /\s*:\s*/, $_ ) )[ 0, 1 ] ] }
+          split( /\n/, readline($proc_status_fh) );
+        return $status{'ppid'};
+    }
+}
+
+sub get_pid_exe {
+    my ($pid) = $_[0] =~ /([0-9]+)/;
+    readlink( '/proc/' . $pid . '/exe' );
+}
+
+sub get_pid_cmdline {
+    my ($pid) = $_[0] =~ /([0-9]+)/;
+    if ( open( my $cmdline, '<', "/proc/$pid/cmdline" ) ) {
+        local $/;
+        my $cmdline = readline($cmdline);
+        $cmdline =~ s/\0$//;
+        $cmdline =~ s/\0/ /g;
+        $cmdline =~ s/[\r\n]//g;
+        return $cmdline;
+    }
+    return '';
+}
+
+sub get_pid_cwd {
+    my ($pid) = $_[0] =~ /([0-9]+)/;
+    readlink( '/proc/' . $pid . '/cwd' ) || '/';
+}
+
+sub get_process_info {
+    my ($pid) = $_[0] =~ /([0-9]+)/;
+
+    my $parentpid = get_parent_pid($pid);
+
+    return {
+        'pid'          => $pid,
+        'ppid'         => $parentpid,
+        'ppid_cmdline' => get_pid_cmdline($parentpid),
+        'pid_cmdline'  => get_pid_cmdline($pid),
+        'pid_exe'      => get_pid_exe($pid),
+        'ppid_exe'     => get_pid_exe($parentpid),
+        'pid_cwd'      => get_pid_cwd($pid),
+        'ppid_cwd'     => get_pid_cwd($parentpid),
+    };
+}
+1;
+
+} # --- END Cpanel/ProcessInfo.pm
+
+
+{ # --- BEGIN Cpanel/Fcntl/Constants.pm
+package Cpanel::Fcntl::Constants;
+
+
+use strict;
+
+
+our $O_RDONLY  = 0;
+our $O_WRONLY  = 1;
+our $O_RDWR    = 2;
+our $O_ACCMODE = 3;
+
+our $F_GETFD = 1;
+our $F_SETFD = 2;
+our $F_GETFL = 3;
+our $F_SETFL = 4;
+
+our $SEEK_SET    = 0;
+our $SEEK_CUR    = 1;
+our $SEEK_END    = 2;
+our $S_IWOTH     = 2;
+our $S_ISUID     = 2048;
+our $S_ISGID     = 1024;
+our $O_CREAT     = 64;
+our $O_EXCL      = 128;
+our $O_TRUNC     = 512;
+our $O_APPEND    = 1024;
+our $O_NONBLOCK  = 2048;
+our $O_DIRECTORY = 65536;
+our $O_NOFOLLOW  = 131072;
+our $O_CLOEXEC   = 524288;
+
+our $S_IFREG  = 32768;
+our $S_IFDIR  = 16384;
+our $S_IFCHR  = 8192;
+our $S_IFBLK  = 24576;
+our $S_IFIFO  = 4096;
+our $S_IFLNK  = 40960;
+our $S_IFSOCK = 49152;
+our $S_IFMT   = 61440;
+
+our $LOCK_EX = 2;
+our $LOCK_NB = 4;
+our $LOCK_UN = 8;
+
+our $FD_CLOEXEC = 1;
+
+1;
+
+} # --- END Cpanel/Fcntl/Constants.pm
+
+
+{ # --- BEGIN Cpanel/Socket/Constants.pm
+package Cpanel::Socket::Constants;
+
+
+use strict;
+
+our $SO_REUSEADDR = 2;
+
+our $AF_UNIX  = 1;
+our $AF_INET  = 2;
+our $AF_INET6 = 10;
+
+our $PROTO_IP   = 0;
+our $PROTO_ICMP = 1;
+our $PROTO_TCP  = 6;
+
+our $SO_PEERCRED = 17;
+our $SOL_SOCKET  = 1;
+our $SOCK_STREAM = 1;
+
+our $SHUT_RD   = 0;
+our $SHUT_WR   = 1;
+our $SHUT_RDWR = 2;
+
+1;
+
+} # --- END Cpanel/Socket/Constants.pm
+
+
+{ # --- BEGIN Cpanel/Hulk/Constants.pm
+package Cpanel::Hulk::Constants;
+
+
+use strict;
+
+
+# use Cpanel::Fcntl::Constants  ();
+# use Cpanel::Socket::Constants ();
+
+*F_GETFL    = \$Cpanel::Fcntl::Constants::F_GETFL;
+*F_SETFL    = \$Cpanel::Fcntl::Constants::F_SETFL;
+*O_NONBLOCK = \$Cpanel::Fcntl::Constants::O_NONBLOCK;
+
+our $EINTR       = 4;
+our $EPIPE       = 32;
+our $EINPROGRESS = 115;
+our $ETIMEDOUT   = 110;
+our $EISCONN     = 106;
+our $ECONNRESET  = 104;
+our $EAGAIN      = 11;
+
+*PROTO_IP   = \$Cpanel::Socket::Constants::PROTO_IP;
+*PROTO_ICMP = \$Cpanel::Socket::Constants::PROTO_ICMP;
+*PROTO_TCP  = \$Cpanel::Socket::Constants::PROTO_TCP;
+
+*SO_PEERCRED = \$Cpanel::Socket::Constants::SO_PEERCRED;
+*SOL_SOCKET  = \$Cpanel::Socket::Constants::SOL_SOCKET;
+*SOCK_STREAM = \$Cpanel::Socket::Constants::SOCK_STREAM;
+
+*AF_INET6 = \$Cpanel::Socket::Constants::AF_INET6;
+*AF_INET  = \$Cpanel::Socket::Constants::AF_INET;
+*AF_UNIX  = \$Cpanel::Socket::Constants::AF_UNIX;
+
+our $TOKEN_SALT_BASE = '$6$';
+our $SALT_LENGTH     = 16;
+
+our $TIME_BASE            = 1410000000;
+our $SIX_HOURS_IN_SECONDS = 21600;
+1;
+
+} # --- END Cpanel/Hulk/Constants.pm
+
+
+{ # --- BEGIN Cpanel/ApacheServerStatus.pm
+package Cpanel::ApacheServerStatus;
+
+
+# use Cpanel::Hulk::Constants ();
+
+
+
+sub new {
+    my ( $class, $args ) = @_;
+
+    my $obj = {};
+
+    bless $obj, $class;
+
+    my $html = $obj->fetch_server_status_html();
+
+    $html =~ m/<table[^\>]*>(.*?)<\/table[^\>]*>/is;
+
+    my $inner_table = $1;
+    $inner_table =~ s/[\r\n\0]//g;
+    my $line_count = 0;
+
+    my ( @index, @data, %server_status );
+
+    while ( $inner_table =~ m/<tr[^\>]*>(.*?)<\/tr[^\>]*>/isg ) {
+        my $contents = $1;
+        @data = map { s/^\s+//; s/\s+$//; lc $_; } ( $contents =~ m/(?:<[^\>]+>)+([^\<]+)/isg );
+        if ( $line_count == 0 ) {
+            @index = @data;
+        }
+        else {
+            my $count = 0;
+            my %named_data = map { $index[ $count++ ] => $_; } @data;
+            $server_status{ $named_data{'pid'} } = \%named_data;
+
+        }
+        $line_count++;
+    }
+
+    $obj->{'server_status'} = \%server_status;
+
+    return $obj;
+}
+
+sub get_status_by_pid {
+    my ( $self, $pid ) = @_;
+
+    return $self->{'server_status'}->{$pid};
+
+}
+
+sub get_apache_port {
+    if ( open( my $ap_port_fh, '<', '/var/cpanel/config/apache/port' ) ) {
+        my $port_txt = readline($ap_port_fh);
+        chomp($port_txt);
+        if ( $port_txt =~ m/:/ ) {
+            return ( split( m/:/, $port_txt ) )[1];
+        }
+        elsif ( $port_txt =~ /^[0-9]+$/ ) {
+            return $port_txt;
+        }
+    }
+}
+
+sub fetch_server_status_html {
+    my ($self) = @_;
+
+    my $port = 80;
+    my $html;
+
+    eval {
+        my $socket_scc;
+        if ( !socket( $socket_scc, $Cpanel::Hulk::Constants::AF_INET, $Cpanel::Hulk::Constants::SOCK_STREAM, $Cpanel::Hulk::Constants::PROTO_TCP ) || !$socket_scc ) {
+            die "Could not setup tcp socket for connection to $port: $!";
+        }
+        if ( !connect( $socket_scc, pack( 'S n a4 x8', $Cpanel::Hulk::Constants::AF_INET, $port, ( pack 'C4', ( split /\./, "127.0.0.1" ) ) ) ) ) {
+            my $non_default_port = $self->get_apache_port();
+            if ( $non_default_port && $non_default_port != $port ) {
+                if ( !connect( $socket_scc, pack( 'S n a4 x8', $Cpanel::Hulk::Constants::AF_INET, $non_default_port, ( pack 'C4', ( split /\./, "127.0.0.1" ) ) ) ) ) {
+                    die "Unable to connect to port $non_default_port on 127.0.0.1: $!";
+
+                }
+            }
+        }
+
+        syswrite( $socket_scc, "GET /whm-server-status HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" );
+
+        local $/;
+
+        $html = readline($socket_scc);
+
+        close($socket_scc);
+    };
+
+    $html;
+}
+
+1;
+
+} # --- END Cpanel/ApacheServerStatus.pm
+
+
+package main;
